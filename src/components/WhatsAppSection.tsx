@@ -180,19 +180,21 @@ export function WhatsAppSection({
     [cleanCode, cleanPhone, message]
   );
 
+  const [autoShortCode] = useState(() => generateShortCode(6));
+
   const finalGeneratedUrl = useMemo(() => {
     if (shortenEnabled) {
-      const slug = customSlug.trim() || 'codigo';
+      const slug = customSlug.trim() || autoShortCode;
       return `${window.location.origin}/s/${slug}`;
     }
     return generatedWaUrl;
-  }, [shortenEnabled, customSlug, generatedWaUrl]);
+  }, [shortenEnabled, customSlug, autoShortCode, generatedWaUrl]);
 
   const previewSlug = useMemo(() => {
     const trimmed = customSlug.trim();
     if (trimmed) return trimmed;
-    return 'codigo';
-  }, [customSlug]);
+    return autoShortCode;
+  }, [customSlug, autoShortCode]);
 
   const formattedSegments = useMemo(() => parseWhatsAppFormatting(message), [message]);
 
@@ -248,7 +250,7 @@ export function WhatsAppSection({
     let finalShortUrl = '';
 
     if (shortenEnabled) {
-      const candidate = customSlug.trim() || generateShortCode(6);
+      const candidate = customSlug.trim() || autoShortCode;
       if (!isValidShortCode(candidate)) {
         setFormError(
           'El alias corto debe tener entre 3 y 32 caracteres (solo letras, números, guiones y guion bajo).'
