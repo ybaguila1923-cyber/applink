@@ -91,6 +91,10 @@ export function WhatsAppSection({
   const [importWorkspaceInput, setImportWorkspaceInput] = useState('');
   const [workspaceMsg, setWorkspaceMsg] = useState<string | null>(null);
 
+  const [qrCustomTitle, setQrCustomTitle] = useState('');
+  const [qrLogoUrl, setQrLogoUrl] = useState('');
+  const qrLogoInputRef = useRef<HTMLInputElement | null>(null);
+
   const messageRef = useRef<HTMLTextAreaElement | null>(null);
   const qrWrapperRef = useRef<HTMLDivElement | null>(null);
   const analyticsSectionRef = useRef<HTMLDivElement | null>(null);
@@ -175,6 +179,14 @@ export function WhatsAppSection({
     () => buildWhatsAppUrl(cleanCode, cleanPhone, message),
     [cleanCode, cleanPhone, message]
   );
+
+  const finalGeneratedUrl = useMemo(() => {
+    if (shortenEnabled) {
+      const slug = customSlug.trim() || 'codigo';
+      return `${window.location.origin}/s/${slug}`;
+    }
+    return generatedWaUrl;
+  }, [shortenEnabled, customSlug, generatedWaUrl]);
 
   const previewSlug = useMemo(() => {
     const trimmed = customSlug.trim();
@@ -594,7 +606,7 @@ export function WhatsAppSection({
             <button
               type="button"
               disabled={!generatedWaUrl}
-              onClick={() => handleCopy('preview-wa', generatedWaUrl)}
+              onClick={() => void handleCopy('preview-wa', finalGeneratedUrl)}
               className="inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[48px] text-[18px] font-medium text-black bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               {copiedKey === 'preview-wa' ? (
@@ -602,7 +614,7 @@ export function WhatsAppSection({
               ) : (
                 <Copy className="w-5 h-5" />
               )}
-              {copiedKey === 'preview-wa' ? 'URL copiada' : 'Copiar URL directa'}
+              {copiedKey === 'preview-wa' ? 'URL copiada' : shortenEnabled ? 'Copiar URL acortada' : 'Copiar URL directa'}
             </button>
           </div>
         </div>
@@ -663,35 +675,119 @@ export function WhatsAppSection({
             </div>
 
             {generatedWaUrl && (
-              <div className="flex flex-col sm:flex-row items-center gap-4 pt-2">
-                <div
-                  ref={qrWrapperRef}
-                  className="p-2.5 bg-white border border-slate-200 rounded-lg shrink-0"
-                >
-                  <QRCodeCanvas value={generatedWaUrl} size={112} level="M" />
+              <div className="space-y-4 pt-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label htmlFor="qr-custom-title" className="text-sm font-medium text-black">
+                      Título en QR (opcional)
+                    </label>
+                    <input
+                      id="qr-custom-title"
+                      type="text"
+                      maxLength={40}
+                      placeholder="Ej. Escanea para chatear"
+                      value={qrCustomTitle}
+                      onChange={(e) => setQrCustomTitle(e.target.value)}
+                      className="w-full h-10 px-3 text-sm bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-black block">
+                      Foto / Logo en QR (opcional)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        ref={qrLogoInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const f = e.target.files?.[0];
+                          if (f) {
+                            const reader = new FileReader();
+                            reader.onload = (evt) => {
+                              if (typeof evt.target?.result === 'string') {
+                                setQrLogoUrl(evt.target.result);
+                              }
+                            };
+                            reader.readAsDataURL(f);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => qrLogoInputRef.current?.click()}
+                        className="px-3 h-10 text-sm font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors truncate"
+                      >
+                        {qrLogoUrl ? 'Cambiar foto' : 'Subir foto logo'}
+                      </button>
+                      {qrLogoUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setQrLogoUrl('')}
+                          className="px-2.5 h-10 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                        >
+                          Quitar
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <div className="flex-1 w-full space-y-2.5">
-                  <p className="text-[18px] text-black leading-relaxed">
-                    Escanea el código QR o descárgalo en imagen PNG.
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={handleDownloadQr}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
-                    >
-                      <QrCode className="w-4 h-4" />
-                      Descargar QR
-                    </button>
-                    <a
-                      href={generatedWaUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-emerald-50 hover:bg-emerald-100 text-black rounded-lg transition-colors whitespace-nowrap"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                      Probar WhatsApp
-                    </a>
+
+                <div className="flex flex-col sm:flex-row items-center gap-4 p-4 bg-slate-50 border border-slate-200 rounded-xl">
+                  <div
+                    ref={qrWrapperRef}
+                    className="p-3 bg-white border border-slate-200 rounded-xl shrink-0 flex flex-col items-center gap-2 text-center shadow-xs"
+                  >
+                    {qrCustomTitle.trim() && (
+                      <span className="text-xs font-bold text-black max-w-[140px] truncate">
+                        {qrCustomTitle.trim()}
+                      </span>
+                    )}
+                    <div className="relative flex items-center justify-center">
+                      <QRCodeCanvas
+                        value={finalGeneratedUrl}
+                        size={128}
+                        level="H"
+                        includeMargin={false}
+                        imageSettings={
+                          qrLogoUrl
+                            ? {
+                                src: qrLogoUrl,
+                                height: 32,
+                                width: 32,
+                                excavate: true,
+                              }
+                            : undefined
+                        }
+                      />
+                    </div>
+                    <span className="text-[10px] text-neutral-500 font-mono">EnlaceFlow</span>
+                  </div>
+
+                  <div className="flex-1 w-full space-y-2.5">
+                    <p className="text-[18px] text-black leading-relaxed">
+                      Código QR personalizado para tu enlace {shortenEnabled ? 'acortado' : 'directo'}.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDownloadQr}
+                        className="inline-flex items-center gap-1.5 px-4 py-2.5 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap shadow-xs"
+                      >
+                        <QrCode className="w-5 h-5" />
+                        Descargar QR en PNG
+                      </button>
+                      <a
+                        href={finalGeneratedUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-4 py-2.5 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
+                      >
+                        <ExternalLink className="w-5 h-5" />
+                        Probar enlace
+                      </a>
+                    </div>
                   </div>
                 </div>
               </div>

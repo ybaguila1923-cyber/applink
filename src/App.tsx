@@ -8,28 +8,56 @@ import { getOrCreateWorkspaceId } from './lib/whatsapp';
 type WorkspaceSection = 'whatsapp' | 'analytics' | 'media';
 
 function parseShortCodeFromPath(pathname: string): string | null {
-  const match = pathname.match(/^\/s\/([a-zA-Z0-9_-]{1,64})\/?$/);
-  return match ? match[1] : null;
+  const matchS = pathname.match(/^\/s\/([a-zA-Z0-9_-]{1,64})\/?$/);
+  if (matchS) return matchS[1];
+  const matchDirect = pathname.match(/^\/([a-zA-Z0-9_-]{3,32})\/?$/);
+  if (matchDirect) {
+    const slug = matchDirect[1];
+    if (['whatsapp', 'analytics', 'media'].includes(slug)) return null;
+    return slug;
+  }
+  return null;
+}
+
+function parseSectionFromPath(pathname: string): WorkspaceSection {
+  if (pathname.startsWith('/analytics')) return 'analytics';
+  if (pathname.startsWith('/media')) return 'media';
+  return 'whatsapp';
 }
 
 function AppContent() {
   const [shortCodeRoute, setShortCodeRoute] = useState<string | null>(() =>
     parseShortCodeFromPath(window.location.pathname)
   );
-  const [activeSection, setActiveSection] = useState<WorkspaceSection>('whatsapp');
+  const [activeSection, setActiveSection] = useState<WorkspaceSection>(() =>
+    parseSectionFromPath(window.location.pathname)
+  );
   const [workspaceId, setWorkspaceId] = useState<string>(() => getOrCreateWorkspaceId());
 
   useEffect(() => {
     const onPopState = () => {
-      setShortCodeRoute(parseShortCodeFromPath(window.location.pathname));
+      const code = parseShortCodeFromPath(window.location.pathname);
+      setShortCodeRoute(code);
+      if (!code) {
+        setActiveSection(parseSectionFromPath(window.location.pathname));
+      }
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
+  const navigateToSection = (section: WorkspaceSection) => {
+    setActiveSection(section);
+    const targetPath = section === 'whatsapp' ? '/' : `/${section}`;
+    if (window.location.pathname !== targetPath) {
+      window.history.pushState({}, '', targetPath);
+    }
+  };
+
   const handleGoHome = () => {
     window.history.pushState({}, '', '/');
     setShortCodeRoute(null);
+    setActiveSection('whatsapp');
   };
 
   if (shortCodeRoute) {
@@ -51,7 +79,7 @@ function AppContent() {
             href="/"
             onClick={(e) => {
               e.preventDefault();
-              setActiveSection('whatsapp');
+              navigateToSection('whatsapp');
             }}
             className="font-display text-xl font-bold tracking-tight text-black whitespace-nowrap shrink-0"
           >
@@ -68,7 +96,7 @@ function AppContent() {
                 <button
                   key={item.key}
                   type="button"
-                  onClick={() => setActiveSection(item.key)}
+                  onClick={() => navigateToSection(item.key)}
                   className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 text-black ${
                     active
                       ? 'font-semibold border-emerald-600'
@@ -85,7 +113,7 @@ function AppContent() {
             <button
               type="button"
               onClick={() =>
-                setActiveSection((prev) => (prev === 'media' ? 'whatsapp' : 'media'))
+                navigateToSection(activeSection === 'media' ? 'whatsapp' : 'media')
               }
               className="inline-flex items-center justify-center px-4 py-2 text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
             >
@@ -104,7 +132,7 @@ function AppContent() {
               <button
                 key={item.key}
                 type="button"
-                onClick={() => setActiveSection(item.key)}
+                onClick={() => navigateToSection(item.key)}
                 className={`min-h-[44px] px-2 text-sm font-medium rounded-md transition-colors truncate text-black ${
                   active ? 'bg-white shadow-xs font-semibold' : ''
                 }`}

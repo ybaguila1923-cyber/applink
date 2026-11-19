@@ -63,11 +63,44 @@ function triggerBrowserSave(blobUrl: string, filename: string) {
   a.remove();
 }
 
+function extractClientYouTubeId(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl.trim());
+    const host = u.hostname.replace(/^www\./, '').toLowerCase();
+    if (host === 'youtu.be') {
+      const id = u.pathname.split('/').filter(Boolean)[0];
+      return id && /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
+    }
+    if (
+      host === 'youtube.com' ||
+      host === 'm.youtube.com' ||
+      host === 'music.youtube.com' ||
+      host === 'youtube-nocookie.com'
+    ) {
+      const v = u.searchParams.get('v');
+      if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2 && ['shorts', 'embed', 'live', 'v'].includes(parts[0])) {
+        const id = parts[1];
+        return id && /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function safeReadJson<T>(resp: Response): Promise<T> {
   const text = await resp.text();
   try {
     return JSON.parse(text) as T;
   } catch {
+    if (resp.status === 404) {
+      throw new Error(
+        'El servicio de servidor para descargas (/api/media) no está activo en este enlace externo (HTTP 404). Abre la vista previa completa con servidor activo o vuelve a publicar la aplicación para procesar MP4 y MP3.'
+      );
+    }
     throw new Error(
       resp.ok
         ? 'El servidor devolvió una respuesta inesperada. Inténtalo de nuevo.'
@@ -176,7 +209,10 @@ export function MediaStudioSection() {
           const errJson = (await resp.json()) as { error?: string };
           if (errJson.error) msg = errJson.error;
         } catch {
-          // ignore
+          if (resp.status === 404) {
+            msg =
+              'El servicio de servidor (/api/media) no está activo en este enlace externo (HTTP 404). Abre la vista previa completa con servidor activo.';
+          }
         }
         throw new Error(msg);
       }
@@ -350,6 +386,48 @@ export function MediaStudioSection() {
 
     try {
       const resp = await fetch(`/api/media/thumbnails?url=${encodeURIComponent(trimmed)}`);
+      if (resp.status === 404) {
+        const videoId = extractClientYouTubeId(trimmed);
+        if (!videoId) {
+          throw new Error('Ingresa una URL válida de YouTube (watch, shorts o youtu.be).');
+        }
+        let title = `YouTube ${videoId}`;
+        let author = 'Canal de YouTube';
+        try {
+          const oe = await fetch(
+            `https://www.youtube.com/oembed?url=${encodeURIComponent(
+              `https://www.youtube.com/watch?v=${videoId}`
+            )}&format=json`
+          );
+          if (oe.ok) {
+            const meta = (await oe.json()) as { title?: string; author_name?: string };
+            if (meta.title) title = meta.title;
+            if (meta.author_name) author = meta.author_name;
+          }
+        } catch {
+          // ignore oembed failure
+        }
+        const variants = [
+          { key: 'maxresdefault', label: 'Full HD (MaxRes)', width: 1280, height: 720 },
+          { key: 'sddefault', label: 'Estándar HD (SD)', width: 640, height: 480 },
+          { key: 'hqdefault', label: 'Alta Calidad (HQ)', width: 480, height: 360 },
+          { key: 'mqdefault', label: 'Media (MQ)', width: 320, height: 180 },
+          { key: 'default', label: 'Miniatura Compacta', width: 120, height: 90 },
+        ];
+        setThumbResult({
+          videoId,
+          title,
+          author,
+          thumbnails: variants.map((v) => ({
+            ...v,
+            url: `https://i.ytimg.com/vi/${videoId}/${v.key}.jpg`,
+            available: true,
+            sizeBytes: 0,
+            filename: `${title.replace(/[^a-zA-Z0-9._\-\s]/g, '').trim().replace(/\s+/g, '_') || videoId}_${v.key}.jpg`,
+          })),
+        });
+        return;
+      }
       const data = await safeReadJson<YouTubeThumbnailResult & { error?: string }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || 'No se pudieron extraer las miniaturas.');

@@ -26,10 +26,20 @@ app.use(express.json({ limit: '2mb' }));
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+interface NotubePendingJob {
+  serverNum: number;
+  videoUrl: string;
+  format: 'mp4hd' | 'mp4' | 'mp3' | 'm4a';
+  nameMp4: string;
+  token: string;
+  requiresConversion?: boolean;
+}
+
 interface CachedMediaTarget {
-  url: string;
+  url?: string;
   audioUrl?: string;
   headers: Record<string, string>;
+  deferredNotube?: NotubePendingJob;
   expiresAt: number;
 }
 
@@ -49,6 +59,20 @@ function cacheMediaTarget(
     url,
     audioUrl,
     headers,
+    expiresAt: now + 30 * 60 * 1000,
+  });
+  return token;
+}
+
+function cacheDeferredNotubeTarget(job: NotubePendingJob): string {
+  const now = Date.now();
+  for (const [k, v] of mediaTokenCache.entries()) {
+    if (v.expiresAt < now) mediaTokenCache.delete(k);
+  }
+  const token = `tok_${crypto.randomBytes(12).toString('hex')}`;
+  mediaTokenCache.set(token, {
+    headers: {},
+    deferredNotube: job,
     expiresAt: now + 30 * 60 * 1000,
   });
   return token;
@@ -88,22 +112,208 @@ function validateExternalUrl(raw: string): URL {
   return parsed;
 }
 
-function resolveMediaSource(rawOrToken: string): {
+const NOTUBE_SERVERS = [60, 61, 62, 63, 64, 65, 55, 56, 57, 58, 59, 50, 51, 52, 66, 67, 68, 69, 70, 71, 72];
+let lastHealthyNotubeServer = 60;
+
+async function findHealthyNotubeServer(exclude: number[] = []): Promise<number> {
+  const ordered = [
+    lastHealthyNotubeServer,
+    ...NOTUBE_SERVERS.filter((n) => n !== lastHealthyNotubeServer),
+  ].filter((n) => !exclude.includes(n));
+
+  for (const num of ordered.slice(0, 6)) {
+    try {
+      const r = await fetch(`https://s${num}.notube.im/weight.php`, {
+        headers: { 'User-Agent': BROWSER_UA, Origin: 'https://notube.im', Referer: 'https://notube.im/' },
+        signal: AbortSignal.timeout(3000),
+      });
+      if (r.ok) {
+        lastHealthyNotubeServer = num;
+        return num;
+      }
+    } catch {
+      // try next server
+    }
+  }
+  return 60;
+}
+
+interface NotubeWeightResp {
+  url_mp4_youtube?: string;
+  weight_total?: string | number;
+  name_mp4?: string;
+  titre_mp4?: string;
+  token?: string;
+  VevoUSA?: string;
+  VideoDuration?: string;
+}
+
+async function callNotubeWeight(
+  serverNum: number,
+  videoUrl: string,
+  format: 'mp4hd' | 'mp4' | 'mp3' | 'm4a'
+): Promise<NotubeWeightResp> {
+  const resp = await fetch(`https://s${serverNum}.notube.im/recover_weight.php`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': BROWSER_UA,
+      Origin: 'https://notube.im',
+      Referer: 'https://notube.im/',
+    },
+    body: new URLSearchParams({
+      url: videoUrl,
+      format,
+      lang: 'es',
+      subscribed: 'false',
+    }),
+    signal: AbortSignal.timeout(9000),
+  });
+  if (!resp.ok) {
+    throw new Error(`Servidor remoto respondió ${resp.status}`);
+  }
+  return (await resp.json()) as NotubeWeightResp;
+}
+
+async function resolveNotubeJob(job: NotubePendingJob): Promise<string> {
+  const tryOnServer = async (
+    serverNum: number,
+    token: string,
+    nameMp4: string
+  ): Promise<{ ok: boolean; busy: boolean; finalToken: string; errorMsg?: string }> => {
+    const rfResp = await fetch(`https://s${serverNum}.notube.im/recover_file.php`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': BROWSER_UA,
+        Origin: 'https://notube.im',
+        Referer: 'https://notube.im/',
+      },
+      body: new URLSearchParams({
+        url: job.videoUrl,
+        format: job.format,
+        name_mp4: nameMp4,
+        lang: 'es',
+        token,
+        subscribed: 'false',
+        playlist: 'false',
+        adblock: 'false',
+      }),
+      signal: AbortSignal.timeout(50000),
+    });
+    const raw = await rfResp.text();
+    let retour = raw.trim();
+    let finalToken = token;
+    try {
+      const parsed = JSON.parse(raw) as { retour?: string; token?: string };
+      if (parsed.retour) retour = parsed.retour;
+      if (parsed.token) finalToken = parsed.token;
+    } catch {
+      // ignore non-json
+    }
+    if (retour === 'OK') {
+      return { ok: true, busy: false, finalToken };
+    }
+    if (retour === 'HS') {
+      return { ok: false, busy: true, finalToken };
+    }
+    if (retour === 'exceeded' || retour === 'limitation') {
+      return {
+        ok: false,
+        busy: false,
+        finalToken,
+        errorMsg: 'El servidor de extracción alcanzó el límite temporal. Intenta de nuevo en unos segundos.',
+      };
+    }
+    return {
+      ok: false,
+      busy: false,
+      finalToken,
+      errorMsg: 'No se pudo preparar este video para descarga en este momento.',
+    };
+  };
+
+  let activeServer = job.serverNum;
+  let activeToken = job.token;
+  let activeName = job.nameMp4;
+  let result = await tryOnServer(activeServer, activeToken, activeName);
+
+  if (!result.ok && result.busy) {
+    const altServer = await findHealthyNotubeServer([activeServer]);
+    const w = await callNotubeWeight(altServer, job.videoUrl, job.format);
+    if (w.token && w.name_mp4) {
+      activeServer = altServer;
+      activeToken = w.token;
+      activeName = w.name_mp4;
+      result = await tryOnServer(activeServer, activeToken, activeName);
+    }
+  }
+
+  if (!result.ok) {
+    throw new Error(result.errorMsg || 'No se pudo procesar el video en el servidor de extracción.');
+  }
+
+  if (job.requiresConversion) {
+    await fetch(`https://s${activeServer}.notube.im/conversion.php`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': BROWSER_UA,
+        Origin: 'https://notube.im',
+        Referer: 'https://notube.im/',
+      },
+      body: new URLSearchParams({ token: result.finalToken }),
+      signal: AbortSignal.timeout(35000),
+    }).catch(() => undefined);
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const dlPage = await fetch(
+      `https://notube.im/es/download?token=${encodeURIComponent(result.finalToken)}`,
+      {
+        headers: { 'User-Agent': BROWSER_UA },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    const html = await dlPage.text();
+    const linkMatch = html.match(/https?:\/\/s\d+\.notube\.(?:im|net)\/download\.php\?[^"'\s<]+/);
+    if (linkMatch?.[0]) {
+      return linkMatch[0];
+    }
+    if (attempt === 0) {
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }
+
+  throw new Error('No se encontró el enlace final de descarga generado.');
+}
+
+async function resolveMediaSourceAsync(rawOrToken: string): Promise<{
   url: string;
   audioUrl?: string;
   headers: Record<string, string>;
-} {
+  sourceFormat?: string;
+}> {
   if (rawOrToken.startsWith('tok_')) {
     const cached = mediaTokenCache.get(rawOrToken);
     if (!cached || cached.expiresAt < Date.now()) {
       mediaTokenCache.delete(rawOrToken);
       throw new Error('El enlace temporal expiró. Analiza la publicación nuevamente.');
     }
+    const sourceFormat = cached.deferredNotube?.format;
+    if (!cached.url && cached.deferredNotube) {
+      const resolved = await resolveNotubeJob(cached.deferredNotube);
+      cached.url = resolved;
+      cached.deferredNotube = undefined;
+    }
+    if (!cached.url) {
+      throw new Error('El enlace temporal no devolvió una fuente descargable válida.');
+    }
     validateExternalUrl(cached.url);
     if (cached.audioUrl) {
       validateExternalUrl(cached.audioUrl);
     }
-    return { url: cached.url, audioUrl: cached.audioUrl, headers: cached.headers };
+    return { url: cached.url, audioUrl: cached.audioUrl, headers: cached.headers, sourceFormat };
   }
   const parsed = validateExternalUrl(rawOrToken);
   return { url: parsed.toString(), headers: {} };
@@ -170,20 +380,24 @@ function detectPlatform(rawUrl: string): 'youtube' | 'tiktok' | 'instagram' | 'f
 async function resolveRedirectIfNeeded(parsed: URL): Promise<URL> {
   const initialPlatform = detectPlatform(parsed.toString());
   const host = parsed.hostname.toLowerCase();
-  const isShortener = [
-    'bit.ly',
-    'tinyurl.com',
-    't.co',
-    'cutt.ly',
-    'rebrand.ly',
-    'buff.ly',
-    'ow.ly',
-    'rb.gy',
-    'is.gd',
-    'share.google',
-    'fb.watch',
-    'ig.me',
-  ].some((d) => host === d || host.endsWith(`.${d}`));
+  const isShortener =
+    [
+      'bit.ly',
+      'tinyurl.com',
+      't.co',
+      'cutt.ly',
+      'rebrand.ly',
+      'buff.ly',
+      'ow.ly',
+      'rb.gy',
+      'is.gd',
+      'share.google',
+      'fb.watch',
+      'ig.me',
+      'vm.tiktok.com',
+      'vt.tiktok.com',
+    ].some((d) => host === d || host.endsWith(`.${d}`)) ||
+    (host.includes('tiktok.com') && parsed.pathname.startsWith('/t/'));
 
   if (initialPlatform !== 'direct' && !isShortener && !parsed.pathname.includes('/share/')) {
     return parsed;
@@ -540,6 +754,197 @@ interface AdaptiveFormatLike {
   decipher?: (player: unknown) => Promise<string>;
 }
 
+async function inspectTikTokViaNotube(rawUrl: string): Promise<InspectResult> {
+  const serverNum = await findHealthyNotubeServer();
+  const [mp4Res, mp3Res] = await Promise.allSettled([
+    callNotubeWeight(serverNum, rawUrl, 'mp4'),
+    callNotubeWeight(serverNum, rawUrl, 'mp3'),
+  ]);
+
+  const mp4Data = mp4Res.status === 'fulfilled' ? mp4Res.value : null;
+  const mp3Data = mp3Res.status === 'fulfilled' ? mp3Res.value : null;
+
+  let title = 'Video de TikTok';
+  const rawTitre = mp4Data?.titre_mp4 || mp3Data?.titre_mp4;
+  if (rawTitre) {
+    try {
+      title = decodeURIComponent(rawTitre.replace(/\+/g, ' ')).trim() || title;
+    } catch {
+      title = rawTitre.replace(/\+/g, ' ').trim() || title;
+    }
+  }
+
+  const options: MediaOption[] = [];
+  let audioToken: string | undefined;
+  if (mp3Data?.token && mp3Data?.name_mp4) {
+    audioToken = cacheDeferredNotubeTarget({
+      serverNum,
+      videoUrl: rawUrl,
+      format: 'mp3',
+      nameMp4: mp3Data.name_mp4,
+      token: mp3Data.token,
+      requiresConversion: true,
+    });
+  }
+
+  if (mp4Data?.token && mp4Data?.name_mp4) {
+    const vidToken = cacheDeferredNotubeTarget({
+      serverNum,
+      videoUrl: rawUrl,
+      format: 'mp4',
+      nameMp4: mp4Data.name_mp4,
+      token: mp4Data.token,
+      requiresConversion: true,
+    });
+    const parsedSize = Number(mp4Data.weight_total);
+    options.push({
+      id: 'tt-notube-hd',
+      label: 'Video MP4 HD (Sin Marca de Agua)',
+      format: 'mp4',
+      quality: '720p HD',
+      resolution: '720p',
+      url: vidToken,
+      audioSourceUrl: audioToken,
+      filename: sanitizeFilename(`${title}_tiktok`, 'mp4'),
+      sizeBytes: Number.isFinite(parsedSize) && parsedSize > 0 ? parsedSize : undefined,
+      noWatermark: true,
+      canConvertMp3: true,
+    });
+  }
+
+  if (audioToken) {
+    options.push({
+      id: 'tt-notube-mp3',
+      label: 'Audio MP3 Extraído',
+      format: 'mp3',
+      quality: 'MP3 192 kbps',
+      resolution: 'Audio',
+      url: audioToken,
+      filename: sanitizeFilename(`${title}_tiktok`, 'mp3'),
+    });
+  }
+
+  if (options.length === 0) {
+    throw new Error('No se pudo extraer este enlace de TikTok. Verifica que el video sea público.');
+  }
+
+  return {
+    platform: 'tiktok',
+    title,
+    author: 'TikTok',
+    thumbnail: '',
+    options,
+  };
+}
+
+async function inspectYouTubeViaNotube(
+  videoId: string,
+  currentTitle: string,
+  currentAuthor: string
+): Promise<{ title: string; options: MediaOption[] }> {
+  const canonicalUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const serverNum = await findHealthyNotubeServer();
+
+  const [hdRes, sdRes, mp3Res] = await Promise.allSettled([
+    callNotubeWeight(serverNum, canonicalUrl, 'mp4hd'),
+    callNotubeWeight(serverNum, canonicalUrl, 'mp4'),
+    callNotubeWeight(serverNum, canonicalUrl, 'mp3'),
+  ]);
+
+  const hdData = hdRes.status === 'fulfilled' ? hdRes.value : null;
+  const sdData = sdRes.status === 'fulfilled' ? sdRes.value : null;
+  const mp3Data = mp3Res.status === 'fulfilled' ? mp3Res.value : null;
+
+  let resolvedTitle = currentTitle;
+  const rawTitre = hdData?.titre_mp4 || sdData?.titre_mp4 || mp3Data?.titre_mp4;
+  if (rawTitre && resolvedTitle.startsWith('YouTube Video (')) {
+    try {
+      resolvedTitle = decodeURIComponent(rawTitre.replace(/\+/g, ' ')).trim() || resolvedTitle;
+    } catch {
+      resolvedTitle = rawTitre.replace(/\+/g, ' ').trim() || resolvedTitle;
+    }
+  }
+
+  let mp3Token: string | undefined;
+  if (mp3Data?.token && mp3Data?.name_mp4) {
+    mp3Token = cacheDeferredNotubeTarget({
+      serverNum,
+      videoUrl: canonicalUrl,
+      format: 'mp3',
+      nameMp4: mp3Data.name_mp4,
+      token: mp3Data.token,
+      requiresConversion: false,
+    });
+  }
+
+  const options: MediaOption[] = [];
+
+  if (hdData?.token && hdData?.name_mp4 && hdData.VideoDuration !== '1') {
+    const parsedSize = Number(hdData.weight_total);
+    const hdToken = cacheDeferredNotubeTarget({
+      serverNum,
+      videoUrl: canonicalUrl,
+      format: 'mp4hd',
+      nameMp4: hdData.name_mp4,
+      token: hdData.token,
+      requiresConversion: false,
+    });
+    options.push({
+      id: 'yt-notube-720p',
+      label: 'Video MP4 Alta Definición (720p HD)',
+      format: 'mp4',
+      quality: '720p HD',
+      resolution: '720p',
+      dimensions: '1280×720',
+      url: hdToken,
+      audioSourceUrl: mp3Token,
+      filename: sanitizeFilename(`${resolvedTitle}_720p`, 'mp4'),
+      sizeBytes: Number.isFinite(parsedSize) && parsedSize > 0 ? parsedSize : undefined,
+      canConvertMp3: true,
+    });
+  }
+
+  if (sdData?.token && sdData?.name_mp4 && sdData.VideoDuration !== '1') {
+    const parsedSize = Number(sdData.weight_total);
+    const sdToken = cacheDeferredNotubeTarget({
+      serverNum,
+      videoUrl: canonicalUrl,
+      format: 'mp4',
+      nameMp4: sdData.name_mp4,
+      token: sdData.token,
+      requiresConversion: false,
+    });
+    options.push({
+      id: 'yt-notube-360p',
+      label: 'Video MP4 Estándar (360p SD)',
+      format: 'mp4',
+      quality: '360p SD',
+      resolution: '360p',
+      dimensions: '640×360',
+      url: sdToken,
+      audioSourceUrl: mp3Token,
+      filename: sanitizeFilename(`${resolvedTitle}_360p`, 'mp4'),
+      sizeBytes: Number.isFinite(parsedSize) && parsedSize > 0 ? parsedSize : undefined,
+      canConvertMp3: true,
+    });
+  }
+
+  if (mp3Token) {
+    options.push({
+      id: 'yt-notube-mp3',
+      label: `Audio MP3 Directo (${currentAuthor})`,
+      format: 'mp3',
+      quality: 'MP3 192 kbps',
+      resolution: 'Audio',
+      url: mp3Token,
+      filename: sanitizeFilename(`${resolvedTitle}_audio`, 'mp3'),
+      canConvertMp3: false,
+    });
+  }
+
+  return { title: resolvedTitle, options };
+}
+
 async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
   const videoId = extractYouTubeId(rawUrl);
   if (!videoId) {
@@ -585,7 +990,7 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
       adaptive_formats?: AdaptiveFormatLike[];
     }
 
-    const clientsToTry = ['IOS', 'ANDROID', 'MWEB', 'ANDROID_VR'] as const;
+    const clientsToTry = ['IOS', 'ANDROID'] as const;
     let streaming: StreamingDataLike | null = null;
 
     for (const client of clientsToTry) {
@@ -633,7 +1038,6 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
 
       const audioToken = bestAudioUrl ? cacheMediaTarget(bestAudioUrl, {}) : undefined;
 
-      // Collect HD adaptive MP4 streams (1080p, 720p, 480p, 360p) muxed with audio
       const videoAdaptive = adaptive
         .filter((f) => String(f.mime_type || '').startsWith('video/mp4'))
         .sort((a, b) => {
@@ -680,7 +1084,6 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
         });
       }
 
-      // Also include combined progressive formats if that resolution wasn't already covered
       for (const fmt of streaming.formats || []) {
         const rawRes = fmt.quality_label || '360p';
         const normResMatch = rawRes.match(/(\d+p)/i);
@@ -726,13 +1129,23 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
       }
     }
   } catch {
-    warning =
-      'YouTube solicitó verificación anti-bots desde el servidor para este video. Prueba con otro enlace (TikTok, Facebook, Instagram) o descarga su miniatura en la pestaña Miniaturas YouTube.';
+    // Will try cloud fallback below
   }
 
-  if (options.length === 0 && !warning) {
+  // Fallback extractor when direct Innertube streams are blocked by datacenter anti-bot checks
+  if (options.length === 0) {
+    try {
+      const cloudRes = await inspectYouTubeViaNotube(videoId, title, author);
+      title = cloudRes.title;
+      options.push(...cloudRes.options);
+    } catch {
+      // Keep clean warning if fallback also fails
+    }
+  }
+
+  if (options.length === 0) {
     warning =
-      'YouTube bloqueó temporalmente la extracción directa de video/audio desde la nube para este enlace (verificación anti-bots). Puedes descargar sus miniaturas HD en la pestaña Miniaturas YouTube o convertir un archivo local en el Conversor a MP3.';
+      'No se pudieron obtener flujos MP4/MP3 para este video de YouTube en este momento (puede tener restricción de duración o privacidad). Puedes descargar sus miniaturas HD en Miniaturas YouTube o convertir un archivo local a MP3.';
   }
 
   return {
@@ -1021,7 +1434,11 @@ app.post('/api/media/inspect', async (req: Request, res: Response) => {
 
     let result: InspectResult;
     if (platform === 'tiktok') {
-      result = await inspectTikTok(parsed.toString());
+      try {
+        result = await inspectTikTok(parsed.toString());
+      } catch {
+        result = await inspectTikTokViaNotube(parsed.toString());
+      }
     } else if (platform === 'youtube') {
       result = await inspectYouTube(parsed.toString());
     } else if (platform === 'instagram') {
@@ -1132,7 +1549,7 @@ app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
       return;
     }
 
-    const { url: targetUrl, audioUrl, headers: extraHeaders } = resolveMediaSource(rawSource);
+    const { url: targetUrl, audioUrl, headers: extraHeaders } = await resolveMediaSourceAsync(rawSource);
 
     // If this token pairs adaptive HD video + audio, mux cleanly into a playable MP4
     if (audioUrl) {
@@ -1180,27 +1597,39 @@ app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
       return;
     }
 
-    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    if (isNonMediaContentType(contentType)) {
+    const rawContentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    if (isNonMediaContentType(rawContentType)) {
       res.status(400).json({
         error: 'El enlace devolvió una página web en lugar de un archivo descargable.',
       });
       return;
     }
 
+    const lowerName = rawName.toLowerCase();
     const contentLength = upstream.headers.get('content-length');
-    const ext = contentType.includes('image/jpeg')
+    const ext = rawContentType.includes('image/jpeg')
       ? 'jpg'
-      : contentType.includes('image/png')
+      : rawContentType.includes('image/png')
       ? 'png'
-      : contentType.includes('audio/mpeg')
+      : rawContentType.includes('audio/mpeg') || lowerName.endsWith('.mp3')
       ? 'mp3'
-      : contentType.includes('audio/mp4')
+      : rawContentType.includes('audio/mp4') || lowerName.endsWith('.m4a')
       ? 'm4a'
       : 'mp4';
 
+    const resolvedContentType =
+      rawContentType === 'application/octet-stream'
+        ? ext === 'mp3'
+          ? 'audio/mpeg'
+          : ext === 'm4a'
+          ? 'audio/mp4'
+          : ext === 'jpg'
+          ? 'image/jpeg'
+          : 'video/mp4'
+        : rawContentType;
+
     const safeName = sanitizeFilename(rawName, ext);
-    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Type', resolvedContentType);
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
     if (contentLength) {
       res.setHeader('Content-Length', contentLength);
@@ -1304,7 +1733,7 @@ app.post('/api/media/convert-mp3', upload.single('file'), async (req: Request, r
       baseName = path.basename(req.file.originalname, path.extname(req.file.originalname)) || 'audio_convertido';
     } else if (req.body?.url) {
       const rawSource = String(req.body.url).trim();
-      const { url: targetUrl, headers: extraHeaders } = resolveMediaSource(rawSource);
+      const { url: targetUrl, headers: extraHeaders } = await resolveMediaSourceAsync(rawSource);
       baseName = String(req.body?.filename || 'audio_convertido');
 
       inputPath = path.join(TEMP_DIR, `in_${crypto.randomUUID()}.bin`);
@@ -1346,7 +1775,14 @@ app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction
 });
 
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
+  const distDir = path.resolve(process.cwd(), 'dist');
+  const distIndexExists = fs.existsSync(path.join(distDir, 'index.html'));
+  const isDevMode =
+    process.env.DISABLE_HMR === 'true' ||
+    process.env.npm_lifecycle_event === 'dev' ||
+    (process.env.NODE_ENV !== 'production' && !distIndexExists);
+
+  if (isDevMode) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1354,7 +1790,6 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distDir, 'index.html'));
