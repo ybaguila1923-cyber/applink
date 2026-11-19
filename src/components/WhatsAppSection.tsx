@@ -310,21 +310,99 @@ export function WhatsAppSection({
 
       await batch.commit();
 
+      // Keep customSlug intact so the user's customized alias is preserved!
       if (shortenEnabled) {
         setSelectedAnalyticsLinkId(linkId);
+        await navigator.clipboard.writeText(finalShortUrl);
+        setCopiedKey('preview-wa');
+        setSaveFeedback(`¡Enlace acortado guardado y copiado al portapapeles: ${finalShortUrl}!`);
+      } else {
+        await navigator.clipboard.writeText(generatedWaUrl);
+        setCopiedKey('preview-wa');
+        setSaveFeedback('¡Enlace directo guardado y copiado al portapapeles!');
       }
-      setLabel('');
-      setCustomSlug('');
-      setSaveFeedback(
-        shortenEnabled
-          ? `Enlace acortado guardado: ${finalShortUrl}`
-          : 'Enlace guardado en tu historial.'
-      );
-      window.setTimeout(() => setSaveFeedback(null), 5000);
+      window.setTimeout(() => setSaveFeedback(null), 6000);
+      window.setTimeout(() => setCopiedKey(null), 3000);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `workspaces/${workspaceId}/links`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleCopyCurrentUrl = async () => {
+    setFormError(null);
+    if (cleanPhone.length < 4 || cleanPhone.length > 18) {
+      setFormError('Ingresa un número de WhatsApp válido (entre 4 y 18 dígitos).');
+      return;
+    }
+    if (!generatedWaUrl) {
+      setFormError('No se pudo construir la URL de WhatsApp.');
+      return;
+    }
+
+    if (shortenEnabled) {
+      const candidate = customSlug.trim() || autoShortCode;
+      if (!isValidShortCode(candidate)) {
+        setFormError(
+          'El alias corto debe tener entre 3 y 32 caracteres (solo letras, números, guiones y guion bajo).'
+        );
+        return;
+      }
+      const urlToCopy = `${window.location.origin}/s/${candidate}`;
+
+      // Persist to Firestore immediately so opening the short URL NEVER gives "página no existe"
+      try {
+        const redirectDoc = await getDoc(doc(db, 'publicRedirects', candidate));
+        if (!redirectDoc.exists()) {
+          const batch = writeBatch(db);
+          const linkId = `lnk_${generateShortCode(10)}`;
+          const safeLabel = (label.trim() || `WhatsApp +${cleanCode} ${cleanPhone}`).slice(0, 100);
+
+          batch.set(doc(db, 'workspaces', workspaceId, 'links', linkId), {
+            id: linkId,
+            workspaceId,
+            label: safeLabel,
+            countryCode: cleanCode,
+            phone: cleanPhone,
+            message: message.slice(0, 2000),
+            targetUrl: generatedWaUrl,
+            shortCode: candidate,
+            shortUrl: urlToCopy,
+            isShortened: true,
+            active: true,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          batch.set(doc(db, 'publicRedirects', candidate), {
+            shortCode: candidate,
+            workspaceId,
+            targetUrl: generatedWaUrl,
+            active: true,
+            clickCount: 0,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+
+          await batch.commit();
+          setSelectedAnalyticsLinkId(linkId);
+        }
+      } catch (err) {
+        console.warn('Auto-save redirect error before copy:', err);
+      }
+
+      await navigator.clipboard.writeText(urlToCopy);
+      setCopiedKey('preview-wa');
+      setSaveFeedback(`¡URL acortada copiada al portapapeles y lista para usar: ${urlToCopy}!`);
+      window.setTimeout(() => setCopiedKey(null), 3000);
+      window.setTimeout(() => setSaveFeedback(null), 6000);
+    } else {
+      await navigator.clipboard.writeText(generatedWaUrl);
+      setCopiedKey('preview-wa');
+      setSaveFeedback('¡URL directa de WhatsApp copiada al portapapeles!');
+      window.setTimeout(() => setCopiedKey(null), 3000);
+      window.setTimeout(() => setSaveFeedback(null), 5000);
     }
   };
 
@@ -608,7 +686,7 @@ export function WhatsAppSection({
             <button
               type="button"
               disabled={!generatedWaUrl}
-              onClick={() => void handleCopy('preview-wa', finalGeneratedUrl)}
+              onClick={handleCopyCurrentUrl}
               className="inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[48px] text-[18px] font-medium text-black bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               {copiedKey === 'preview-wa' ? (
@@ -664,15 +742,45 @@ export function WhatsAppSection({
           </div>
 
           <div className="space-y-3 pt-2 border-t border-slate-100">
-            <div className="space-y-1.5">
-              <p className="text-[18px] font-medium text-black">URL generada</p>
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-[18px] text-black break-all">
-                {generatedWaUrl || 'Ingresa un número para ver tu enlace https://wa.me/...'}
-              </div>
-              {shortenEnabled && (
-                <p className="text-[18px] text-black truncate">
-                  Corto: {window.location.origin}/s/{previewSlug}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-[18px] font-semibold text-black">
+                  {shortenEnabled ? 'URL acortada generada' : 'URL directa generada'}
                 </p>
+                <button
+                  type="button"
+                  disabled={!generatedWaUrl}
+                  onClick={handleCopyCurrentUrl}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors"
+                >
+                  {copiedKey === 'preview-wa' ? (
+                    <>
+                      <Check className="w-4 h-4 text-emerald-600" />
+                      <span>Copiado</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4" />
+                      <span>Copiar URL</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg text-[18px] text-black font-mono font-medium break-all select-all shadow-2xs">
+                {finalGeneratedUrl || 'Ingresa un número para ver tu enlace'}
+              </div>
+
+              {shortenEnabled && (
+                <div className="text-[16px] text-black/80 space-y-1 pt-1">
+                  <p className="break-all">
+                    <span className="font-semibold text-black">Destino WhatsApp:</span>{' '}
+                    <span className="font-mono text-sm">{generatedWaUrl}</span>
+                  </p>
+                  <p className="text-emerald-700 font-medium">
+                    ✓ Esta URL acortada redirecciona automáticamente al chat de WhatsApp y registra métricas de clics.
+                  </p>
+                </div>
               )}
             </div>
 

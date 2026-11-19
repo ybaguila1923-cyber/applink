@@ -347,6 +347,45 @@ export function MediaStudioSection() {
     }
   };
 
+  const handleDownloadDirectImage = async (imageUrl: string, filename: string) => {
+    try {
+      const resp = await fetch(imageUrl, { mode: 'cors' });
+      if (resp.ok) {
+        const blob = await resp.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        triggerBrowserSave(blobUrl, filename);
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+        return;
+      }
+    } catch {
+      // CORS fallback
+    }
+
+    try {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || 1280;
+        canvas.height = img.naturalHeight || 720;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+          triggerBrowserSave(dataUrl, filename);
+          return;
+        }
+        triggerBrowserSave(imageUrl, filename);
+      };
+      img.onerror = () => {
+        triggerBrowserSave(imageUrl, filename);
+      };
+      img.src = imageUrl;
+    } catch {
+      triggerBrowserSave(imageUrl, filename);
+    }
+  };
+
   const handleInspectSocial = async (e?: React.FormEvent) => {
     e?.preventDefault();
     const trimmed = socialUrl.trim();
@@ -358,15 +397,151 @@ export function MediaStudioSection() {
     setThumbFailed(false);
 
     try {
-      const resp = await fetch('/api/media/inspect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed }),
-      });
-      const data = await safeReadJson<MediaInspectResult & { error?: string }>(resp);
-      if (!resp.ok) {
-        throw new Error(data.error || 'No se pudo analizar la publicación.');
+      let data: (MediaInspectResult & { error?: string }) | null = null;
+      let resp: Response | null = null;
+
+      try {
+        resp = await fetch('/api/media/inspect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: trimmed }),
+        });
+        if (resp.ok) {
+          data = await safeReadJson<MediaInspectResult & { error?: string }>(resp);
+        }
+      } catch {
+        // Backend not reachable, fall through to client fallback
       }
+
+      // If backend was unreachable or returned 404/405/error, execute client fallback
+      if (!data || data.error || !resp || !resp.ok) {
+        const ytId = extractClientYouTubeId(trimmed);
+        if (ytId) {
+          let title = `YouTube ${ytId}`;
+          let author = 'Canal de YouTube';
+          try {
+            const oe = await fetch(
+              `https://www.youtube.com/oembed?url=${encodeURIComponent(
+                `https://www.youtube.com/watch?v=${ytId}`
+              )}&format=json`
+            );
+            if (oe.ok) {
+              const meta = (await oe.json()) as { title?: string; author_name?: string };
+              if (meta.title) title = meta.title;
+              if (meta.author_name) author = meta.author_name;
+            }
+          } catch {
+            // ignore
+          }
+
+          const safeTitle =
+            title.replace(/[^a-zA-Z0-9._\-\s]/g, '').trim().replace(/\s+/g, '_') || ytId;
+
+          data = {
+            platform: 'youtube',
+            title,
+            author,
+            thumbnail: `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
+            options: [
+              {
+                id: `yt-opt-thumb-${ytId}`,
+                label: 'Miniatura Full HD (JPG)',
+                format: 'jpg',
+                quality: 'Full HD 1080p',
+                resolution: '1280×720',
+                url: `https://i.ytimg.com/vi/${ytId}/maxresdefault.jpg`,
+                filename: `${safeTitle}_miniatura_hd.jpg`,
+                canConvertMp3: false,
+              },
+              {
+                id: `yt-opt-thumb-sd-${ytId}`,
+                label: 'Miniatura Estándar (JPG)',
+                format: 'jpg',
+                quality: 'Alta Calidad 720p',
+                resolution: '640×480',
+                url: `https://i.ytimg.com/vi/${ytId}/sddefault.jpg`,
+                filename: `${safeTitle}_miniatura_sd.jpg`,
+                canConvertMp3: false,
+              },
+            ],
+            warning:
+              'Para este video de YouTube puedes descargar su miniatura HD directamente o probar la conversión de video a MP3 en la pestaña Conversor a MP3.',
+          };
+        } else if (trimmed.includes('tiktok.com')) {
+          try {
+            const tikResp = await fetch(
+              `https://www.tikwm.com/api/?url=${encodeURIComponent(trimmed)}`
+            );
+            if (tikResp.ok) {
+              const tikJson = await tikResp.json();
+              if (tikJson.data) {
+                const item = tikJson.data;
+                const tikTitle = item.title || 'Video de TikTok';
+                const safeName =
+                  tikTitle.slice(0, 40).replace(/[^a-zA-Z0-9._\-\s]/g, '').trim().replace(/\s+/g, '_') ||
+                  'tiktok_video';
+                const tikOptions: MediaOption[] = [];
+                if (item.play) {
+                  tikOptions.push({
+                    id: 'tik-play-nowm',
+                    label: 'Video MP4 (Sin marca de agua)',
+                    format: 'mp4',
+                    quality: 'Original HD',
+                    resolution: 'HD',
+                    noWatermark: true,
+                    url: item.play,
+                    filename: `${safeName}_sin_marca.mp4`,
+                    canConvertMp3: true,
+                  });
+                }
+                if (item.wmplay) {
+                  tikOptions.push({
+                    id: 'tik-play-wm',
+                    label: 'Video MP4 (Con marca de agua)',
+                    format: 'mp4',
+                    quality: 'Original',
+                    resolution: 'SD',
+                    url: item.wmplay,
+                    filename: `${safeName}_con_marca.mp4`,
+                    canConvertMp3: true,
+                  });
+                }
+                if (item.music) {
+                  tikOptions.push({
+                    id: 'tik-music',
+                    label: 'Audio Original (MP3)',
+                    format: 'mp3',
+                    quality: '192 kbps',
+                    resolution: 'Audio',
+                    url: item.music,
+                    filename: `${safeName}_audio.mp3`,
+                    canConvertMp3: false,
+                  });
+                }
+                data = {
+                  platform: 'tiktok',
+                  title: tikTitle,
+                  author: item.author?.nickname || 'TikTok',
+                  thumbnail: item.cover || '',
+                  options: tikOptions,
+                };
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      if (!data || (data.options.length === 0 && !data.warning)) {
+        if (resp && !resp.ok) {
+          throw new Error(
+            `El servidor no pudo procesar el enlace (HTTP ${resp.status}). Verifica que el enlace sea público o inténtalo nuevamente.`
+          );
+        }
+        throw new Error('No se pudo analizar la publicación. Verifica que el enlace sea público.');
+      }
+
       setInspectResult(data);
     } catch (err) {
       setInspectError(err instanceof Error ? err.message : 'Error al consultar la URL.');
@@ -385,54 +560,45 @@ export function MediaStudioSection() {
     setThumbResult(null);
 
     try {
-      const resp = await fetch(`/api/media/thumbnails?url=${encodeURIComponent(trimmed)}`);
-      if (resp.status === 404) {
-        const videoId = extractClientYouTubeId(trimmed);
-        if (!videoId) {
-          throw new Error('Ingresa una URL válida de YouTube (watch, shorts o youtu.be).');
-        }
-        let title = `YouTube ${videoId}`;
-        let author = 'Canal de YouTube';
-        try {
-          const oe = await fetch(
-            `https://www.youtube.com/oembed?url=${encodeURIComponent(
-              `https://www.youtube.com/watch?v=${videoId}`
-            )}&format=json`
-          );
-          if (oe.ok) {
-            const meta = (await oe.json()) as { title?: string; author_name?: string };
-            if (meta.title) title = meta.title;
-            if (meta.author_name) author = meta.author_name;
-          }
-        } catch {
-          // ignore oembed failure
-        }
-        const variants = [
-          { key: 'maxresdefault', label: 'Full HD (MaxRes)', width: 1280, height: 720 },
-          { key: 'sddefault', label: 'Estándar HD (SD)', width: 640, height: 480 },
-          { key: 'hqdefault', label: 'Alta Calidad (HQ)', width: 480, height: 360 },
-          { key: 'mqdefault', label: 'Media (MQ)', width: 320, height: 180 },
-          { key: 'default', label: 'Miniatura Compacta', width: 120, height: 90 },
-        ];
-        setThumbResult({
-          videoId,
-          title,
-          author,
-          thumbnails: variants.map((v) => ({
-            ...v,
-            url: `https://i.ytimg.com/vi/${videoId}/${v.key}.jpg`,
-            available: true,
-            sizeBytes: 0,
-            filename: `${title.replace(/[^a-zA-Z0-9._\-\s]/g, '').trim().replace(/\s+/g, '_') || videoId}_${v.key}.jpg`,
-          })),
-        });
-        return;
+      const videoId = extractClientYouTubeId(trimmed);
+      if (!videoId) {
+        throw new Error('Ingresa una URL válida de YouTube (watch, shorts o youtu.be).');
       }
-      const data = await safeReadJson<YouTubeThumbnailResult & { error?: string }>(resp);
-      if (!resp.ok) {
-        throw new Error(data.error || 'No se pudieron extraer las miniaturas.');
+      let title = `YouTube ${videoId}`;
+      let author = 'Canal de YouTube';
+      try {
+        const oe = await fetch(
+          `https://www.youtube.com/oembed?url=${encodeURIComponent(
+            `https://www.youtube.com/watch?v=${videoId}`
+          )}&format=json`
+        );
+        if (oe.ok) {
+          const meta = (await oe.json()) as { title?: string; author_name?: string };
+          if (meta.title) title = meta.title;
+          if (meta.author_name) author = meta.author_name;
+        }
+      } catch {
+        // ignore oembed failure
       }
-      setThumbResult(data);
+      const variants = [
+        { key: 'maxresdefault', label: 'Full HD (1080p / 720p)', width: 1280, height: 720 },
+        { key: 'hqdefault', label: 'Alta Calidad (HQ)', width: 480, height: 360 },
+        { key: 'sddefault', label: 'Estándar (SD)', width: 640, height: 480 },
+        { key: 'mqdefault', label: 'Media (MQ)', width: 320, height: 180 },
+        { key: 'default', label: 'Miniatura Compacta', width: 120, height: 90 },
+      ];
+      setThumbResult({
+        videoId,
+        title,
+        author,
+        thumbnails: variants.map((v) => ({
+          ...v,
+          url: `https://i.ytimg.com/vi/${videoId}/${v.key}.jpg`,
+          available: true,
+          sizeBytes: 0,
+          filename: `${title.replace(/[^a-zA-Z0-9._\-\s]/g, '').trim().replace(/\s+/g, '_') || videoId}_${v.key}.jpg`,
+        })),
+      });
     } catch (err) {
       setThumbError(err instanceof Error ? err.message : 'Error al procesar URL de YouTube.');
     } finally {
@@ -971,21 +1137,11 @@ export function MediaStudioSection() {
                         </div>
                         <button
                           type="button"
-                          onClick={() =>
-                            void enqueueProxyDownload(
-                              `${thumbResult.title} (${t.label})`,
-                              'youtube',
-                              'JPG',
-                              `${t.width}×${t.height}`,
-                              t.url,
-                              t.filename,
-                              t.sizeBytes
-                            )
-                          }
+                          onClick={() => void handleDownloadDirectImage(t.url, t.filename)}
                           className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
                         >
                           <ArrowDownToLine className="w-4 h-4" />
-                          JPG
+                          Descargar JPG
                         </button>
                       </div>
                     </div>
@@ -1277,6 +1433,19 @@ export function MediaStudioSection() {
                       <RefreshCw className="w-4 h-4" />
                       Reintentar
                     </button>
+                  )}
+
+                  {item.status === 'error' && item.sourceUrl?.startsWith('http') && (
+                    <a
+                      href={item.sourceUrl}
+                      download={item.filename}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg transition-colors whitespace-nowrap"
+                    >
+                      <ArrowDownToLine className="w-4 h-4" />
+                      Descarga directa
+                    </a>
                   )}
 
                   <button
