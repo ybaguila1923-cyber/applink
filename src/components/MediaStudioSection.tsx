@@ -98,7 +98,7 @@ async function safeReadJson<T>(resp: Response): Promise<T> {
   } catch {
     if (resp.status === 404) {
       throw new Error(
-        'El servicio de servidor para descargas (/api/media) no está activo en este enlace externo (HTTP 404). Abre la vista previa completa con servidor activo o vuelve a publicar la aplicación para procesar MP4 y MP3.'
+        'El servidor backend de la API de descargas (/api/media) no está disponible en este dominio estático externo (HTTP 404). Por favor utiliza la URL de desarrollo integrada o vuelve a desplegar/publicar con el servidor Node.js activo.'
       );
     }
     throw new Error(
