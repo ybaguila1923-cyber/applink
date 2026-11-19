@@ -35,19 +35,19 @@ export class ErrorBoundary extends React.Component<
       }
 
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6 text-black">
           <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-6 space-y-4">
             <div className="flex items-center gap-3 text-red-600">
-              <AlertTriangle className="w-5 h-5 shrink-0" />
-              <h2 className="text-lg font-semibold text-slate-900">Algo no salió como esperábamos</h2>
+              <AlertTriangle className="w-6 h-6 shrink-0" />
+              <h2 className="text-xl font-semibold text-black">Algo no salió como esperábamos</h2>
             </div>
-            <p className="text-sm text-slate-600 leading-relaxed break-words">{friendly}</p>
+            <p className="text-[18px] text-black leading-relaxed break-words">{friendly}</p>
             <button
               type="button"
               onClick={() => window.location.reload()}
-              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap"
+              className="inline-flex items-center gap-2 px-4 py-2.5 text-[18px] font-medium text-white bg-black rounded-lg hover:bg-neutral-800 transition-colors whitespace-nowrap"
             >
-              <RotateCcw className="w-4 h-4" />
+              <RotateCcw className="w-5 h-5" />
               Recargar aplicación
             </button>
           </div>

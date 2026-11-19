@@ -63,11 +63,49 @@ function triggerBrowserSave(blobUrl: string, filename: string) {
   a.remove();
 }
 
+async function safeReadJson<T>(resp: Response): Promise<T> {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(
+      resp.ok
+        ? 'El servidor devolvió una respuesta inesperada. Inténtalo de nuevo.'
+        : `El servidor no pudo procesar el enlace (HTTP ${resp.status}). Verifica que el enlace sea público o inténtalo nuevamente.`
+    );
+  }
+}
+
+type PreferredVideoSize = 'best' | '1080p' | '720p' | '480p' | '360p';
+
+function pickPreferredVideoOption(
+  options: MediaOption[],
+  preferred: PreferredVideoSize
+): MediaOption | null {
+  const videoOptions = options.filter((o) => o.format === 'mp4' || o.format === 'webm');
+  if (videoOptions.length === 0) return null;
+  if (preferred === 'best') return videoOptions[0];
+  const exact = videoOptions.find(
+    (o) =>
+      o.resolution?.toLowerCase() === preferred ||
+      o.quality.toLowerCase().includes(preferred)
+  );
+  if (exact) return exact;
+  const targetNum = parseInt(preferred, 10) || 720;
+  const sorted = [...videoOptions].sort((a, b) => {
+    const aNum = parseInt(a.resolution || a.quality || '720', 10) || 720;
+    const bNum = parseInt(b.resolution || b.quality || '720', 10) || 720;
+    return Math.abs(aNum - targetNum) - Math.abs(bNum - targetNum);
+  });
+  return sorted[0];
+}
+
 export function MediaStudioSection() {
   const [activeTab, setActiveTab] = useState<MediaToolTab>('social');
 
   // Social Downloader state
   const [socialUrl, setSocialUrl] = useState('');
+  const [preferredSize, setPreferredSize] = useState<PreferredVideoSize>('best');
   const [inspecting, setInspecting] = useState(false);
   const [inspectError, setInspectError] = useState<string | null>(null);
   const [inspectResult, setInspectResult] = useState<MediaInspectResult | null>(null);
@@ -242,8 +280,14 @@ export function MediaStudioSection() {
         signal: controller.signal,
       });
       if (!resp.ok) {
-        const errData = (await resp.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errData.error || 'No se pudo convertir el audio a MP3.');
+        let msg = 'No se pudo convertir el audio a MP3.';
+        try {
+          const errData = await safeReadJson<{ error?: string }>(resp);
+          if (errData.error) msg = errData.error;
+        } catch (parseErr) {
+          if (parseErr instanceof Error) msg = parseErr.message;
+        }
+        throw new Error(msg);
       }
       const blob = await resp.blob();
       const blobUrl = URL.createObjectURL(blob);
@@ -283,7 +327,7 @@ export function MediaStudioSection() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
       });
-      const data = (await resp.json()) as MediaInspectResult & { error?: string };
+      const data = await safeReadJson<MediaInspectResult & { error?: string }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || 'No se pudo analizar la publicación.');
       }
@@ -306,7 +350,7 @@ export function MediaStudioSection() {
 
     try {
       const resp = await fetch(`/api/media/thumbnails?url=${encodeURIComponent(trimmed)}`);
-      const data = (await resp.json()) as YouTubeThumbnailResult & { error?: string };
+      const data = await safeReadJson<YouTubeThumbnailResult & { error?: string }>(resp);
       if (!resp.ok) {
         throw new Error(data.error || 'No se pudieron extraer las miniaturas.');
       }
@@ -363,8 +407,14 @@ export function MediaStudioSection() {
         });
 
         if (!resp.ok) {
-          const errData = (await resp.json().catch(() => ({}))) as { error?: string };
-          throw new Error(errData.error || 'Error al convertir el archivo.');
+          let msg = 'Error al convertir el archivo.';
+          try {
+            const errData = await safeReadJson<{ error?: string }>(resp);
+            if (errData.error) msg = errData.error;
+          } catch (parseErr) {
+            if (parseErr instanceof Error) msg = parseErr.message;
+          }
+          throw new Error(msg);
         }
 
         const blob = await resp.blob();
@@ -402,7 +452,7 @@ export function MediaStudioSection() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: trimmed }),
         });
-        const info = (await inspectResp.json()) as MediaInspectResult & { error?: string };
+        const info = await safeReadJson<MediaInspectResult & { error?: string }>(inspectResp);
         if (!inspectResp.ok) {
           throw new Error(info.error || 'No se pudo leer el enlace de video.');
         }
@@ -418,16 +468,22 @@ export function MediaStudioSection() {
             directMp3.sizeBytes
           );
         } else {
-          const candidate = info.options.find(
-            (o) => o.format === 'm4a' || o.format === 'mp4' || o.format === 'webm'
-          );
+          const candidate =
+            info.options.find((o) => o.format === 'm4a') ||
+            info.options.find((o) => o.audioSourceUrl) ||
+            info.options.find((o) => o.format === 'mp4' || o.format === 'webm');
           if (!candidate) {
             throw new Error(
               info.warning ||
-                'No hay flujo de audio/video directo disponible desde este enlace. Prueba subiendo el archivo en la pestaña Archivo local.'
+                'No hay flujo de audio/video directo disponible desde este enlace. Prueba subiendo el archivo en la pestaña "Subir archivo de video".'
             );
           }
-          await enqueueMp3FromUrl(info.title, candidate.url, info.title, mp3Bitrate);
+          await enqueueMp3FromUrl(
+            info.title,
+            candidate.audioSourceUrl || candidate.url,
+            info.title,
+            mp3Bitrate
+          );
         }
         setMp3Url('');
       } catch (err) {
@@ -450,6 +506,11 @@ export function MediaStudioSection() {
     });
   }, [queue, queueFilter]);
 
+  const matchedVideoOption = useMemo(() => {
+    if (!inspectResult) return null;
+    return pickPreferredVideoOption(inspectResult.options, preferredSize);
+  }, [inspectResult, preferredSize]);
+
   const handleDownloadOption = (opt: MediaOption, res: MediaInspectResult) => {
     void enqueueProxyDownload(
       res.title,
@@ -463,15 +524,15 @@ export function MediaStudioSection() {
   };
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-8 text-black">
       {/* Section Header + Tool Switcher */}
       <section className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="space-y-1">
-            <h1 className="text-xl sm:text-2xl font-semibold text-slate-900 tracking-tight">
+          <div className="space-y-1.5">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-black tracking-tight">
               Estudio de Descargas y Audio MP3
             </h1>
-            <p className="text-sm text-slate-600">
+            <p className="text-[18px] text-black leading-relaxed">
               Descarga videos de TikTok sin marca de agua, Facebook, YouTube, imágenes de Instagram, miniaturas HD y convierte videos a MP3.
             </p>
           </div>
@@ -480,10 +541,8 @@ export function MediaStudioSection() {
             <button
               type="button"
               onClick={() => setActiveTab('social')}
-              className={`px-3.5 py-2 text-xs sm:text-sm font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'social'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
+              className={`px-3.5 py-2 text-[18px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 text-black ${
+                activeTab === 'social' ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
               }`}
             >
               Descargador Social
@@ -491,10 +550,8 @@ export function MediaStudioSection() {
             <button
               type="button"
               onClick={() => setActiveTab('thumbnails')}
-              className={`px-3.5 py-2 text-xs sm:text-sm font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'thumbnails'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
+              className={`px-3.5 py-2 text-[18px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 text-black ${
+                activeTab === 'thumbnails' ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
               }`}
             >
               Miniaturas YouTube
@@ -502,10 +559,8 @@ export function MediaStudioSection() {
             <button
               type="button"
               onClick={() => setActiveTab('mp3')}
-              className={`px-3.5 py-2 text-xs sm:text-sm font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === 'mp3'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
+              className={`px-3.5 py-2 text-[18px] font-medium rounded-md transition-colors whitespace-nowrap shrink-0 text-black ${
+                activeTab === 'mp3' ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
               }`}
             >
               Conversor a MP3
@@ -516,48 +571,80 @@ export function MediaStudioSection() {
         {/* Tool 1: Social Downloader */}
         {activeTab === 'social' && (
           <div className="space-y-5 pt-2 border-t border-slate-100">
-            <form onSubmit={handleInspectSocial} className="flex flex-col sm:flex-row gap-3">
-              <div className="flex-1">
-                <label htmlFor="social-url-input" className="sr-only">
-                  Pega el enlace de YouTube, TikTok, Facebook o Instagram
-                </label>
-                <input
-                  id="social-url-input"
-                  type="url"
-                  required
-                  placeholder="Pega aquí la URL de YouTube, TikTok, Facebook o Instagram…"
-                  value={socialUrl}
-                  onChange={(e) => setSocialUrl(e.target.value)}
-                  className="w-full h-11 px-4 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
-                />
+            <form onSubmit={handleInspectSocial} className="space-y-3">
+              <div className="flex flex-col sm:flex-row gap-3">
+                <div className="flex-1">
+                  <label htmlFor="social-url-input" className="sr-only">
+                    Pega el enlace de YouTube, TikTok, Facebook o Instagram
+                  </label>
+                  <input
+                    id="social-url-input"
+                    type="url"
+                    required
+                    placeholder="Pega aquí la URL de YouTube, TikTok, Facebook o Instagram…"
+                    value={socialUrl}
+                    onChange={(e) => setSocialUrl(e.target.value)}
+                    className="w-full h-12 px-4 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={inspecting}
+                  className="inline-flex items-center justify-center gap-2 h-12 px-5 text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  {inspecting ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <ArrowDownToLine className="w-5 h-5" />
+                  )}
+                  Analizar enlace
+                </button>
               </div>
-              <button
-                type="submit"
-                disabled={inspecting}
-                className="inline-flex items-center justify-center gap-2 h-11 px-5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
-              >
-                {inspecting ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <ArrowDownToLine className="w-4 h-4" />
-                )}
-                Analizar enlace
-              </button>
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                <label htmlFor="preferred-mp4-size" className="text-[18px] font-medium text-black">
+                  ¿Qué tamaño / resolución MP4 prefieres descargar?
+                </label>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(
+                    [
+                      { key: 'best', label: 'Mejor disponible' },
+                      { key: '1080p', label: '1080p Full HD' },
+                      { key: '720p', label: '720p HD' },
+                      { key: '480p', label: '480p SD' },
+                      { key: '360p', label: '360p Ligero' },
+                    ] as const
+                  ).map((sz) => (
+                    <button
+                      key={sz.key}
+                      type="button"
+                      onClick={() => setPreferredSize(sz.key)}
+                      className={`px-3 py-1.5 text-[18px] rounded-lg border transition-colors whitespace-nowrap ${
+                        preferredSize === sz.key
+                          ? 'bg-emerald-600 text-white border-emerald-600 font-medium'
+                          : 'bg-slate-50 text-black border-slate-200 hover:bg-slate-100'
+                      }`}
+                    >
+                      {sz.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </form>
 
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-              <span>YouTube (Video / Audio)</span>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[18px] text-black">
+              <span>YouTube (Video MP4 / Audio)</span>
               <span aria-hidden="true">·</span>
-              <span>TikTok (Sin marca de agua)</span>
+              <span>TikTok (MP4 Sin marca de agua)</span>
               <span aria-hidden="true">·</span>
-              <span>Instagram (Imágenes y Reels)</span>
+              <span>Instagram (Imágenes y Reels MP4)</span>
               <span aria-hidden="true">·</span>
-              <span>Facebook (HD / SD)</span>
+              <span>Facebook (MP4 HD / SD)</span>
             </div>
 
             {inspectError && (
-              <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs sm:text-sm text-red-700 flex items-start gap-2.5">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-[18px] text-red-700 flex items-start gap-2.5">
+                <AlertCircle className="w-5 h-5 shrink-0 mt-1" />
                 <span>{inspectError}</span>
               </div>
             )}
@@ -575,98 +662,161 @@ export function MediaStudioSection() {
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <div className="flex flex-col items-center gap-1.5 text-slate-400 p-4 text-center">
+                      <div className="flex flex-col items-center gap-1.5 text-black p-4 text-center">
                         <Film className="w-7 h-7" />
-                        <span className="text-xs">{platformDisplayName(inspectResult.platform)}</span>
+                        <span className="text-[18px]">{platformDisplayName(inspectResult.platform)}</span>
                       </div>
                     )}
                   </div>
                   <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <div className="flex flex-wrap items-center gap-2 text-[18px] text-black">
                       <span>{platformDisplayName(inspectResult.platform)}</span>
                       <span aria-hidden="true">·</span>
                       <span className="truncate">{inspectResult.author}</span>
                       {inspectResult.durationSec ? (
                         <>
                           <span aria-hidden="true">·</span>
-                          <span className="font-mono tabular-nums">
+                          <span className="tabular-nums">
                             {formatDuration(inspectResult.durationSec)}
                           </span>
                         </>
                       ) : null}
                     </div>
-                    <h3 className="text-sm font-semibold text-slate-900 line-clamp-2">
+                    <h3 className="text-[18px] font-semibold text-black line-clamp-2">
                       {inspectResult.title}
                     </h3>
                   </div>
                 </div>
 
-                <div className="md:col-span-8 space-y-3">
+                <div className="md:col-span-8 space-y-4">
                   {inspectResult.warning && (
-                    <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800">
-                      {inspectResult.warning}
+                    <div className="p-4 rounded-lg bg-amber-50 border border-amber-200 text-[18px] text-black space-y-3">
+                      <p>{inspectResult.warning}</p>
+                      {inspectResult.platform === 'youtube' && inspectResult.options.length === 0 && (
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setYtThumbUrl(socialUrl);
+                              setActiveTab('thumbnails');
+                            }}
+                            className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium bg-white border border-slate-300 hover:bg-slate-100 text-black rounded-lg transition-colors"
+                          >
+                            <ImageIcon className="w-4 h-4" />
+                            Ir a Miniaturas YouTube
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setMp3Mode('file');
+                              setActiveTab('mp3');
+                            }}
+                            className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium bg-white border border-slate-300 hover:bg-slate-100 text-black rounded-lg transition-colors"
+                          >
+                            <FileAudio className="w-4 h-4" />
+                            Convertir archivo local a MP3
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
 
-                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
-                    {inspectResult.options.map((opt) => (
-                      <div
-                        key={opt.id}
-                        className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                      >
-                        <div className="min-w-0 space-y-0.5">
-                          <p className="text-sm font-medium text-slate-900">{opt.label}</p>
-                          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                            <span className="font-mono uppercase">{opt.format}</span>
-                            <span aria-hidden="true">·</span>
-                            <span>{opt.quality}</span>
-                            {opt.noWatermark && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="text-emerald-700 font-medium">Sin marca de agua</span>
-                              </>
-                            )}
-                            {opt.sizeBytes ? (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span className="font-mono tabular-nums">
-                                  {formatBytes(opt.sizeBytes)}
-                                </span>
-                              </>
-                            ) : null}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 shrink-0">
-                          {opt.canConvertMp3 && (
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void enqueueMp3FromUrl(
-                                  inspectResult.title,
-                                  opt.url,
-                                  inspectResult.title,
-                                  mp3Bitrate
-                                )
-                              }
-                              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors whitespace-nowrap"
-                            >
-                              <Music className="w-3.5 h-3.5" />
-                              Extraer MP3
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleDownloadOption(opt, inspectResult)}
-                            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap"
-                          >
-                            <ArrowDownToLine className="w-3.5 h-3.5" />
-                            Descargar
-                          </button>
-                        </div>
+                  {matchedVideoOption && (
+                    <div className="p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="space-y-0.5">
+                        <p className="text-[18px] font-semibold text-black">
+                          Tamaño seleccionado: {matchedVideoOption.resolution || matchedVideoOption.quality}
+                          {matchedVideoOption.dimensions ? ` (${matchedVideoOption.dimensions})` : ''}
+                        </p>
+                        <p className="text-[18px] text-black">
+                          Formato {matchedVideoOption.format.toUpperCase()}
+                          {matchedVideoOption.sizeBytes ? ` · ${formatBytes(matchedVideoOption.sizeBytes)}` : ''}
+                          {matchedVideoOption.noWatermark ? ' · Sin marca de agua' : ''}
+                        </p>
                       </div>
-                    ))}
-                  </div>
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadOption(matchedVideoOption, inspectResult)}
+                        className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
+                      >
+                        <ArrowDownToLine className="w-5 h-5" />
+                        Descargar MP4 ({matchedVideoOption.resolution || matchedVideoOption.quality})
+                      </button>
+                    </div>
+                  )}
+
+                  {inspectResult.options.length > 0 && (
+                    <div className="divide-y divide-slate-100 border border-slate-200 rounded-lg">
+                      {inspectResult.options.map((opt) => {
+                        const isMatched = matchedVideoOption?.id === opt.id;
+                        return (
+                          <div
+                            key={opt.id}
+                            className={`px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                              isMatched ? 'bg-slate-50/80' : ''
+                            }`}
+                          >
+                            <div className="min-w-0 space-y-0.5">
+                              <p className="text-[18px] font-medium text-black">{opt.label}</p>
+                              <div className="flex flex-wrap items-center gap-2 text-[18px] text-black">
+                                <span className="uppercase">{opt.format}</span>
+                                <span aria-hidden="true">·</span>
+                                <span>{opt.quality}</span>
+                                {opt.dimensions && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="tabular-nums">{opt.dimensions}</span>
+                                  </>
+                                )}
+                                {opt.noWatermark && (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="text-emerald-700 font-medium">Sin marca de agua</span>
+                                  </>
+                                )}
+                                {opt.sizeBytes ? (
+                                  <>
+                                    <span aria-hidden="true">·</span>
+                                    <span className="tabular-nums">
+                                      {formatBytes(opt.sizeBytes)}
+                                    </span>
+                                  </>
+                                ) : null}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2 shrink-0">
+                              {opt.canConvertMp3 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void enqueueMp3FromUrl(
+                                      inspectResult.title,
+                                      opt.audioSourceUrl || opt.url,
+                                      inspectResult.title,
+                                      mp3Bitrate
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
+                                >
+                                  <Music className="w-4 h-4" />
+                                  Extraer MP3
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleDownloadOption(opt, inspectResult)}
+                                className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap"
+                              >
+                                <ArrowDownToLine className="w-4 h-4" />
+                                Descargar {opt.format.toUpperCase()}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -688,35 +838,35 @@ export function MediaStudioSection() {
                   placeholder="Pega la URL del video o Short de YouTube…"
                   value={ytThumbUrl}
                   onChange={(e) => setYtThumbUrl(e.target.value)}
-                  className="w-full h-11 px-4 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  className="w-full h-12 px-4 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
                 />
               </div>
               <button
                 type="submit"
                 disabled={loadingThumbs}
-                className="inline-flex items-center justify-center gap-2 h-11 px-5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                className="inline-flex items-center justify-center gap-2 h-12 px-5 text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0"
               >
                 {loadingThumbs ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="w-5 h-5 animate-spin" />
                 ) : (
-                  <ImageIcon className="w-4 h-4" />
+                  <ImageIcon className="w-5 h-5" />
                 )}
                 Obtener miniaturas
               </button>
             </form>
 
             {thumbError && (
-              <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-xs sm:text-sm text-red-700 flex items-start gap-2.5">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-[18px] text-red-700 flex items-start gap-2.5">
+                <AlertCircle className="w-5 h-5 shrink-0 mt-1" />
                 <span>{thumbError}</span>
               </div>
             )}
 
             {thumbResult && (
               <div className="space-y-4 pt-2 border-t border-slate-100">
-                <div className="space-y-0.5">
-                  <p className="text-xs text-slate-500">{thumbResult.author}</p>
-                  <h3 className="text-base font-semibold text-slate-900">{thumbResult.title}</h3>
+                <div className="space-y-1">
+                  <p className="text-[18px] text-black">{thumbResult.author}</p>
+                  <h3 className="text-xl font-semibold text-black">{thumbResult.title}</h3>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -735,8 +885,8 @@ export function MediaStudioSection() {
                       </div>
                       <div className="p-3.5 flex items-center justify-between gap-3">
                         <div className="min-w-0">
-                          <p className="text-sm font-medium text-slate-900 truncate">{t.label}</p>
-                          <p className="text-xs font-mono tabular-nums text-slate-500">
+                          <p className="text-[18px] font-medium text-black truncate">{t.label}</p>
+                          <p className="text-[18px] tabular-nums text-black">
                             {t.width}×{t.height}
                             {t.sizeBytes ? ` · ${formatBytes(t.sizeBytes)}` : ''}
                           </p>
@@ -754,9 +904,9 @@ export function MediaStudioSection() {
                               t.sizeBytes
                             )
                           }
-                          className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
+                          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
                         >
-                          <ArrowDownToLine className="w-3.5 h-3.5" />
+                          <ArrowDownToLine className="w-4 h-4" />
                           JPG
                         </button>
                       </div>
@@ -776,10 +926,8 @@ export function MediaStudioSection() {
                 <button
                   type="button"
                   onClick={() => setMp3Mode('file')}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                    mp3Mode === 'file'
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
+                  className={`px-3.5 py-2 text-[18px] font-medium rounded-md transition-colors whitespace-nowrap text-black ${
+                    mp3Mode === 'file' ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
                   }`}
                 >
                   Subir archivo de video
@@ -787,10 +935,8 @@ export function MediaStudioSection() {
                 <button
                   type="button"
                   onClick={() => setMp3Mode('url')}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                    mp3Mode === 'url'
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
+                  className={`px-3.5 py-2 text-[18px] font-medium rounded-md transition-colors whitespace-nowrap text-black ${
+                    mp3Mode === 'url' ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
                   }`}
                 >
                   Convertir desde URL
@@ -798,18 +944,18 @@ export function MediaStudioSection() {
               </div>
 
               <div className="flex items-center gap-2">
-                <label htmlFor="mp3-bitrate" className="text-xs font-medium text-slate-600">
+                <label htmlFor="mp3-bitrate" className="text-[18px] font-medium text-black">
                   Calidad MP3:
                 </label>
                 <select
                   id="mp3-bitrate"
                   value={mp3Bitrate}
                   onChange={(e) => setMp3Bitrate(e.target.value as '128k' | '192k' | '320k')}
-                  className="h-9 px-2.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  className="h-11 px-3 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
                 >
-                  <option value="128k">128 kbps (Ligero)</option>
-                  <option value="192k">192 kbps (Estándar)</option>
-                  <option value="320k">320 kbps (Alta fidelidad)</option>
+                  <option value="128k">128 kbps</option>
+                  <option value="192k">192 kbps</option>
+                  <option value="320k">320 kbps</option>
                 </select>
               </div>
             </div>
@@ -834,20 +980,20 @@ export function MediaStudioSection() {
                     onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
                   />
                   <div className="space-y-2">
-                    <Upload className="w-7 h-7 text-slate-400 mx-auto" />
+                    <Upload className="w-7 h-7 text-black mx-auto" />
                     {selectedFile ? (
-                      <div className="space-y-0.5">
-                        <p className="text-sm font-semibold text-slate-900">{selectedFile.name}</p>
-                        <p className="text-xs font-mono tabular-nums text-slate-500">
+                      <div className="space-y-1">
+                        <p className="text-[18px] font-semibold text-black">{selectedFile.name}</p>
+                        <p className="text-[18px] tabular-nums text-black">
                           {formatBytes(selectedFile.size)} · Listo para extraer audio a MP3 ({mp3Bitrate})
                         </p>
                       </div>
                     ) : (
                       <div className="space-y-1">
-                        <p className="text-sm font-medium text-slate-800">
+                        <p className="text-[18px] font-medium text-black">
                           Haz clic o arrastra un video aquí (MP4, MOV, WebM, MKV)
                         </p>
-                        <p className="text-xs text-slate-500">
+                        <p className="text-[18px] text-black">
                           Conversión directa en servidor con FFmpeg hasta 150 MB
                         </p>
                       </div>
@@ -861,13 +1007,13 @@ export function MediaStudioSection() {
                   placeholder="Pega la URL del video (TikTok, Facebook, YouTube o MP4 directo)…"
                   value={mp3Url}
                   onChange={(e) => setMp3Url(e.target.value)}
-                  className="w-full h-11 px-4 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  className="w-full h-12 px-4 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
                 />
               )}
 
               {mp3Error && (
-                <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700 flex items-start gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-[18px] text-red-700 flex items-start gap-2">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-1" />
                   <span>{mp3Error}</span>
                 </div>
               )}
@@ -875,12 +1021,12 @@ export function MediaStudioSection() {
               <button
                 type="submit"
                 disabled={convertingMp3}
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[44px] text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center justify-center gap-2 px-5 py-3 min-h-[48px] text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
               >
                 {convertingMp3 ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="w-5 h-5 animate-spin" />
                 ) : (
-                  <FileAudio className="w-4 h-4" />
+                  <FileAudio className="w-5 h-5" />
                 )}
                 {convertingMp3 ? 'Convirtiendo audio a MP3…' : 'Convertir y descargar MP3'}
               </button>
@@ -892,14 +1038,14 @@ export function MediaStudioSection() {
       {/* Clean Unified Download Manager */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="space-y-0.5">
+          <div className="space-y-1">
             <div className="flex items-center gap-3">
-              <h2 className="text-base font-semibold text-slate-900">Gestor de descargas</h2>
-              <span className="text-xs font-mono tabular-nums text-slate-500">
+              <h2 className="text-xl font-semibold text-black">Gestor de descargas</h2>
+              <span className="text-[18px] tabular-nums text-black">
                 {queue.length} elementos
               </span>
             </div>
-            <p className="text-xs text-slate-500">
+            <p className="text-[18px] text-black">
               Administra el progreso, cancela tareas o vuelve a guardar archivos descargados.
             </p>
           </div>
@@ -917,10 +1063,8 @@ export function MediaStudioSection() {
                   key={tab.key}
                   type="button"
                   onClick={() => setQueueFilter(tab.key)}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                    queueFilter === tab.key
-                      ? 'bg-white text-slate-900 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900'
+                  className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors whitespace-nowrap text-black ${
+                    queueFilter === tab.key ? 'bg-white shadow-xs font-semibold' : 'hover:bg-slate-200/60'
                   }`}
                 >
                   {tab.label}
@@ -936,9 +1080,9 @@ export function MediaStudioSection() {
                     prev.filter((i) => i.status === 'downloading' || i.status === 'converting')
                   )
                 }
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-black bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
               >
-                <Trash2 className="w-3.5 h-3.5" />
+                <Trash2 className="w-4 h-4" />
                 Limpiar lista
               </button>
             )}
@@ -946,10 +1090,10 @@ export function MediaStudioSection() {
         </div>
 
         {filteredQueue.length === 0 ? (
-          <div className="p-8 text-center space-y-1.5">
-            <ArrowDownToLine className="w-6 h-6 text-slate-400 mx-auto" />
-            <p className="text-sm font-medium text-slate-900">Cola de descargas vacía</p>
-            <p className="text-xs text-slate-500">
+          <div className="p-8 text-center space-y-2">
+            <ArrowDownToLine className="w-7 h-7 text-black mx-auto" />
+            <p className="text-[18px] font-semibold text-black">Cola de descargas vacía</p>
+            <p className="text-[18px] text-black">
               Todas tus descargas de videos, imágenes, miniaturas y conversiones a MP3 aparecerán aquí.
             </p>
           </div>
@@ -958,36 +1102,36 @@ export function MediaStudioSection() {
             {filteredQueue.map((item) => (
               <div
                 key={item.id}
-                className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
               >
                 <div className="min-w-0 flex-1 space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium text-slate-900 truncate max-w-md">
+                  <div className="flex flex-wrap items-center gap-2 text-[18px]">
+                    <span className="font-semibold text-black truncate max-w-md">
                       {item.title}
                     </span>
-                    <span className="text-xs text-slate-400" aria-hidden="true">
+                    <span className="text-black" aria-hidden="true">
                       ·
                     </span>
-                    <span className="text-xs text-slate-600">
+                    <span className="text-black">
                       {platformDisplayName(item.platform)}
                     </span>
-                    <span className="text-xs text-slate-400" aria-hidden="true">
+                    <span className="text-black" aria-hidden="true">
                       ·
                     </span>
-                    <span className="text-xs font-mono text-slate-700">
+                    <span className="text-black">
                       {item.format} ({item.quality})
                     </span>
                   </div>
 
                   {(item.status === 'downloading' || item.status === 'converting') && (
                     <div className="space-y-1 max-w-md">
-                      <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                      <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
                         <div
                           className="h-full bg-emerald-600 transition-all duration-150"
                           style={{ width: `${item.progressPct}%` }}
                         />
                       </div>
-                      <p className="text-[11px] font-mono tabular-nums text-slate-500">
+                      <p className="text-[18px] tabular-nums text-black">
                         {item.status === 'converting'
                           ? 'Convirtiendo audio con FFmpeg…'
                           : `Descargando ${formatBytes(item.bytesLoaded)}${
@@ -998,18 +1142,18 @@ export function MediaStudioSection() {
                   )}
 
                   {item.status === 'completed' && (
-                    <p className="text-xs text-emerald-700 inline-flex items-center gap-1.5 font-mono tabular-nums">
-                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    <p className="text-[18px] text-emerald-700 inline-flex items-center gap-1.5 tabular-nums">
+                      <CheckCircle2 className="w-5 h-5 shrink-0" />
                       Completado · {formatBytes(item.bytesLoaded)}
                     </p>
                   )}
 
                   {item.status === 'error' && (
-                    <p className="text-xs text-red-600">{item.errorMessage || 'Error en descarga'}</p>
+                    <p className="text-[18px] text-red-600">{item.errorMessage || 'Error en descarga'}</p>
                   )}
 
                   {item.status === 'cancelled' && (
-                    <p className="text-xs text-slate-500">Cancelado por el usuario</p>
+                    <p className="text-[18px] text-black">Cancelado por el usuario</p>
                   )}
                 </div>
 
@@ -1018,9 +1162,9 @@ export function MediaStudioSection() {
                     <button
                       type="button"
                       onClick={() => item.abortController?.abort()}
-                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1 px-3.5 py-2 text-[18px] font-medium text-black bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <X className="w-3.5 h-3.5" />
+                      <X className="w-4 h-4" />
                       Cancelar
                     </button>
                   )}
@@ -1029,9 +1173,9 @@ export function MediaStudioSection() {
                     <button
                       type="button"
                       onClick={() => triggerBrowserSave(item.blobUrl!, item.filename)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <ArrowDownToLine className="w-3.5 h-3.5" />
+                      <ArrowDownToLine className="w-4 h-4" />
                       Guardar archivo
                     </button>
                   )}
@@ -1050,9 +1194,9 @@ export function MediaStudioSection() {
                           item.bytesTotal
                         )
                       }
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium text-black bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <RefreshCw className="w-3.5 h-3.5" />
+                      <RefreshCw className="w-4 h-4" />
                       Reintentar
                     </button>
                   )}
@@ -1064,9 +1208,9 @@ export function MediaStudioSection() {
                       setQueue((prev) => prev.filter((q) => q.id !== item.id));
                     }}
                     title="Quitar de la lista"
-                    className="inline-flex items-center justify-center p-2 text-slate-400 hover:text-red-600 rounded-lg transition-colors"
+                    className="inline-flex items-center justify-center p-2.5 text-black hover:text-red-600 rounded-lg transition-colors"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
               </div>

@@ -45,13 +45,13 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
 
         const telemetry = detectClientTelemetry();
         const clickId = `clk_${generateShortCode(12)}`;
-        const clickRef = doc(db, 'publicRedirects', shortCode, 'clicks', clickId);
+        const clickRef = doc(db, 'workspaces', data.workspaceId, 'clicks', clickId);
 
         const batch = writeBatch(db);
         batch.set(clickRef, {
           clickId,
           shortCode,
-          ownerId: data.ownerId,
+          workspaceId: data.workspaceId,
           deviceType: telemetry.deviceType,
           browser: telemetry.browser,
           os: telemetry.os,
@@ -88,14 +88,14 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
   }, [shortCode]);
 
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-      <div className="max-w-md w-full bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-5">
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6 text-black">
+      <div className="max-w-lg w-full bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-5">
         {status === 'loading' && (
           <>
             <Loader2 className="w-8 h-8 text-emerald-600 animate-spin mx-auto" />
-            <div className="space-y-1.5">
-              <h1 className="text-xl font-semibold text-slate-900">Conectando con WhatsApp</h1>
-              <p className="text-sm text-slate-500">Registrando enlace /{shortCode} y redirigiendo…</p>
+            <div className="space-y-2">
+              <h1 className="text-2xl font-semibold text-black">Conectando con WhatsApp</h1>
+              <p className="text-[18px] text-black">Registrando enlace /{shortCode} y redirigiendo…</p>
             </div>
           </>
         )}
@@ -105,26 +105,26 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
             <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-700 flex items-center justify-center mx-auto">
               <MessageSquare className="w-6 h-6" />
             </div>
-            <div className="space-y-1.5">
-              <h1 className="text-xl font-semibold text-slate-900">Abriendo conversación en WhatsApp</h1>
-              <p className="text-sm text-slate-500">
+            <div className="space-y-2">
+              <h1 className="text-2xl font-semibold text-black">Abriendo conversación en WhatsApp</h1>
+              <p className="text-[18px] text-black">
                 Si la aplicación no se abre automáticamente, usa el botón de abajo.
               </p>
             </div>
-            <div className="pt-2 flex flex-col gap-2.5">
+            <div className="pt-2 flex flex-col gap-3">
               <a
                 href={targetUrl}
-                className="inline-flex items-center justify-center gap-2 w-full px-4 py-2.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors"
+                className="inline-flex items-center justify-center gap-2 w-full px-4 py-3 text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors"
               >
-                <ExternalLink className="w-4 h-4" />
+                <ExternalLink className="w-5 h-5" />
                 Abrir WhatsApp ahora
               </a>
               <button
                 type="button"
                 onClick={onGoHome}
-                className="inline-flex items-center justify-center gap-2 w-full px-4 py-2 text-sm font-medium text-slate-600 hover:text-slate-900 transition-colors"
+                className="inline-flex items-center justify-center gap-2 w-full px-4 py-2.5 text-[18px] font-medium text-black hover:bg-slate-100 rounded-lg transition-colors"
               >
-                <ArrowLeft className="w-4 h-4" />
+                <ArrowLeft className="w-5 h-5" />
                 Volver a EnlaceFlow
               </button>
             </div>
@@ -136,18 +136,18 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
             <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center mx-auto">
               <ShieldAlert className="w-6 h-6" />
             </div>
-            <div className="space-y-1.5">
-              <h1 className="text-xl font-semibold text-slate-900">Enlace pausado</h1>
-              <p className="text-sm text-slate-500">
+            <div className="space-y-2">
+              <h1 className="text-2xl font-semibold text-black">Enlace pausado</h1>
+              <p className="text-[18px] text-black">
                 El creador de este enlace acortado lo ha desactivado temporalmente.
               </p>
             </div>
             <button
               type="button"
               onClick={onGoHome}
-              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors"
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 text-[18px] font-medium text-white bg-black rounded-lg hover:bg-neutral-800 transition-colors"
             >
-              <ArrowLeft className="w-4 h-4" />
+              <ArrowLeft className="w-5 h-5" />
               Ir a EnlaceFlow
             </button>
           </>
@@ -158,11 +158,11 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
             <div className="w-12 h-12 rounded-xl bg-red-50 text-red-600 flex items-center justify-center mx-auto">
               <ShieldAlert className="w-6 h-6" />
             </div>
-            <div className="space-y-1.5">
-              <h1 className="text-xl font-semibold text-slate-900">
+            <div className="space-y-2">
+              <h1 className="text-2xl font-semibold text-black">
                 {status === 'not_found' ? 'Enlace no encontrado' : 'Error al abrir enlace'}
               </h1>
-              <p className="text-sm text-slate-500 break-words">
+              <p className="text-[18px] text-black break-words">
                 {status === 'not_found'
                   ? `No existe ningún enlace activo con el código "${shortCode}".`
                   : errorMsg}
@@ -171,9 +171,9 @@ export function RedirectView({ shortCode, onGoHome }: RedirectViewProps) {
             <button
               type="button"
               onClick={onGoHome}
-              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors"
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 text-[18px] font-medium text-white bg-black rounded-lg hover:bg-neutral-800 transition-colors"
             >
-              <ArrowLeft className="w-4 h-4" />
+              <ArrowLeft className="w-5 h-5" />
               Crear un enlace de WhatsApp
             </button>
           </>

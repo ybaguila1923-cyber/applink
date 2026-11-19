@@ -18,42 +18,27 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidWorkspaceId(wsId) {
+      return wsId is string && wsId.size() >= 16 && wsId.size() <= 64 && wsId.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
     function isValidShortCode(code) {
       return code is string && code.size() >= 3 && code.size() <= 32 && code.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
-    }
-
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
-    }
-
-    function isValidUserProfile(data, userId) {
-      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
-        && data.uid is string && data.uid == userId && isValidId(data.uid)
-        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
-        && data.displayName is string && data.displayName.size() <= 120
-        && data.photoURL is string && data.photoURL.size() <= 512
-        && data.createdAt is timestamp
-        && data.updatedAt is timestamp;
-    }
-
-    function isValidUserLink(data, userId, linkId) {
+    function isValidWorkspaceLink(data, workspaceId, linkId) {
       return data.keys().hasAll([
-          'id', 'ownerId', 'label', 'countryCode', 'phone', 'message',
+          'id', 'workspaceId', 'label', 'countryCode', 'phone', 'message',
           'targetUrl', 'shortCode', 'shortUrl', 'isShortened', 'active',
           'createdAt', 'updatedAt'
         ])
         && data.keys().hasOnly([
-          'id', 'ownerId', 'label', 'countryCode', 'phone', 'message',
+          'id', 'workspaceId', 'label', 'countryCode', 'phone', 'message',
           'targetUrl', 'shortCode', 'shortUrl', 'isShortened', 'active',
           'createdAt', 'updatedAt'
         ])
         && data.id is string && data.id == linkId && data.id.size() >= 3 && data.id.size() <= 64
-        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.workspaceId is string && data.workspaceId == workspaceId && isValidWorkspaceId(data.workspaceId)
         && data.label is string && data.label.size() >= 1 && data.label.size() <= 100
         && data.countryCode is string && data.countryCode.size() >= 1 && data.countryCode.size() <= 6 && data.countryCode.matches('^[0-9]{1,5}$')
         && data.phone is string && data.phone.size() >= 4 && data.phone.size() <= 20 && data.phone.matches('^[0-9]{4,18}$')
@@ -69,10 +54,10 @@ service cloud.firestore {
     }
 
     function isValidPublicRedirect(data, shortCode) {
-      return data.keys().hasAll(['shortCode', 'ownerId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['shortCode', 'ownerId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
+      return data.keys().hasAll(['shortCode', 'workspaceId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['shortCode', 'workspaceId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
         && data.shortCode is string && data.shortCode == shortCode && isValidShortCode(data.shortCode)
-        && data.ownerId is string && isValidId(data.ownerId)
+        && data.workspaceId is string && isValidWorkspaceId(data.workspaceId)
         && data.targetUrl is string && data.targetUrl.size() >= 12 && data.targetUrl.size() <= 4096
         && data.targetUrl.matches('^https://(wa\\.me|api\\.whatsapp\\.com)/.*')
         && data.active is bool
@@ -81,12 +66,12 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    function isValidClickEvent(data, shortCode, clickId) {
-      return data.keys().hasAll(['clickId', 'shortCode', 'ownerId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
-        && data.keys().hasOnly(['clickId', 'shortCode', 'ownerId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
+    function isValidClickEvent(data, workspaceId, clickId) {
+      return data.keys().hasAll(['clickId', 'shortCode', 'workspaceId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
+        && data.keys().hasOnly(['clickId', 'shortCode', 'workspaceId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
         && data.clickId is string && data.clickId == clickId && data.clickId.size() >= 6 && data.clickId.size() <= 64
-        && data.shortCode is string && data.shortCode == shortCode && isValidShortCode(data.shortCode)
-        && data.ownerId is string && isValidId(data.ownerId)
+        && data.shortCode is string && isValidShortCode(data.shortCode)
+        && data.workspaceId is string && data.workspaceId == workspaceId && isValidWorkspaceId(data.workspaceId)
         && data.deviceType is string && data.deviceType in ['mobile', 'desktop', 'tablet']
         && data.browser is string && data.browser.size() >= 1 && data.browser.size() <= 60
         && data.os is string && data.os.size() >= 1 && data.os.size() <= 60
@@ -94,55 +79,52 @@ service cloud.firestore {
         && data.clickedAt is timestamp;
     }
 
-    match /users/{userId} {
-      allow get: if isValidId(userId) && isOwner(userId);
-      allow list: if false;
-      allow create: if isValidId(userId)
-        && isOwner(userId)
-        && isValidUserProfile(incoming(), userId)
-        && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
-      allow update: if isValidId(userId)
-        && isOwner(userId)
-        && isValidUserProfile(incoming(), userId)
-        && incoming().uid == existing().uid
-        && incoming().createdAt == existing().createdAt
-        && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'updatedAt']);
-      allow delete: if false;
+    match /workspaces/{workspaceId} {
+      allow read, write: if false;
 
       match /links/{linkId} {
-        allow get: if isValidId(userId) && isValidId(linkId) && isOwner(userId);
-        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
-        allow create: if isValidId(userId)
+        allow get: if isValidWorkspaceId(workspaceId) && isValidId(linkId);
+        allow list: if isValidWorkspaceId(workspaceId) && resource.data.workspaceId == workspaceId;
+        allow create: if isValidWorkspaceId(workspaceId)
           && isValidId(linkId)
-          && isOwner(userId)
-          && isValidUserLink(incoming(), userId, linkId)
+          && isValidWorkspaceLink(incoming(), workspaceId, linkId)
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
-        allow update: if isValidId(userId)
+        allow update: if isValidWorkspaceId(workspaceId)
           && isValidId(linkId)
-          && isOwner(userId)
-          && isValidUserLink(incoming(), userId, linkId)
+          && isValidWorkspaceLink(incoming(), workspaceId, linkId)
           && incoming().id == existing().id
-          && incoming().ownerId == existing().ownerId
+          && incoming().workspaceId == existing().workspaceId
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && (
             incoming().diff(existing()).affectedKeys().hasOnly(['label', 'countryCode', 'phone', 'message', 'targetUrl', 'updatedAt'])
             || incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt'])
           );
-        allow delete: if isValidId(userId) && isValidId(linkId) && isOwner(userId);
+        allow delete: if isValidWorkspaceId(workspaceId) && isValidId(linkId);
+      }
+
+      match /clicks/{clickId} {
+        allow get: if isValidWorkspaceId(workspaceId) && isValidId(clickId);
+        allow list: if isValidWorkspaceId(workspaceId) && resource.data.workspaceId == workspaceId;
+        allow create: if isValidWorkspaceId(workspaceId)
+          && isValidId(clickId)
+          && isValidClickEvent(incoming(), workspaceId, clickId)
+          && incoming().clickedAt == request.time
+          && exists(/databases/$(database)/documents/publicRedirects/$(incoming().shortCode))
+          && get(/databases/$(database)/documents/publicRedirects/$(incoming().shortCode)).data.active == true
+          && get(/databases/$(database)/documents/publicRedirects/$(incoming().shortCode)).data.workspaceId == workspaceId
+          && getAfter(/databases/$(database)/documents/publicRedirects/$(incoming().shortCode)).data.clickCount == get(/databases/$(database)/documents/publicRedirects/$(incoming().shortCode)).data.clickCount + 1;
+        allow update: if false;
+        allow delete: if isValidWorkspaceId(workspaceId) && isValidId(clickId);
       }
     }
 
     match /publicRedirects/{shortCode} {
       allow get: if isValidShortCode(shortCode);
-      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if false;
       allow create: if isValidShortCode(shortCode)
-        && isSignedIn()
         && isValidPublicRedirect(incoming(), shortCode)
-        && incoming().ownerId == request.auth.uid
         && incoming().clickCount == 0
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -150,28 +132,13 @@ service cloud.firestore {
         && isValidPublicRedirect(incoming(), shortCode)
         && incoming().updatedAt == request.time
         && incoming().createdAt == existing().createdAt
-        && incoming().ownerId == existing().ownerId
+        && incoming().workspaceId == existing().workspaceId
         && incoming().shortCode == existing().shortCode
         && (
-          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'targetUrl', 'updatedAt']))
+          incoming().diff(existing()).affectedKeys().hasOnly(['active', 'targetUrl', 'updatedAt'])
           || (existing().active == true && incoming().diff(existing()).affectedKeys().hasOnly(['clickCount', 'updatedAt']) && incoming().clickCount == existing().clickCount + 1)
         );
-      allow delete: if isValidShortCode(shortCode) && isSignedIn() && existing().ownerId == request.auth.uid;
-
-      match /clicks/{clickId} {
-        allow get: if isValidShortCode(shortCode) && isValidId(clickId) && isSignedIn() && existing().ownerId == request.auth.uid;
-        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
-        allow create: if isValidShortCode(shortCode)
-          && isValidId(clickId)
-          && isValidClickEvent(incoming(), shortCode, clickId)
-          && incoming().clickedAt == request.time
-          && exists(/databases/$(database)/documents/publicRedirects/$(shortCode))
-          && get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.active == true
-          && incoming().ownerId == get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.ownerId
-          && getAfter(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.clickCount == get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.clickCount + 1;
-        allow update: if false;
-        allow delete: if isValidShortCode(shortCode) && isValidId(clickId) && isSignedIn() && existing().ownerId == request.auth.uid;
-      }
+      allow delete: if isValidShortCode(shortCode);
     }
   }
 }

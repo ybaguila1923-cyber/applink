@@ -1,46 +1,8 @@
 {
   "entities": {
-    "UserProfile": {
-      "title": "UserProfile",
-      "description": "Private user account profile for link history ownership.",
-      "type": "object",
-      "properties": {
-        "uid": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_\\-]+$"
-        },
-        "email": {
-          "type": "string",
-          "format": "email",
-          "minLength": 3,
-          "maxLength": 254
-        },
-        "displayName": {
-          "type": "string",
-          "minLength": 0,
-          "maxLength": 120
-        },
-        "photoURL": {
-          "type": "string",
-          "minLength": 0,
-          "maxLength": 512
-        },
-        "createdAt": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "updatedAt": {
-          "type": "string",
-          "format": "date-time"
-        }
-      },
-      "required": ["uid", "email", "displayName", "photoURL", "createdAt", "updatedAt"]
-    },
-    "UserLink": {
-      "title": "UserLink",
-      "description": "WhatsApp link entry owned by a specific user, storing phone, custom message, and optional short link reference.",
+    "WorkspaceLink": {
+      "title": "WorkspaceLink",
+      "description": "WhatsApp link entry stored under a browser workspace without requiring login.",
       "type": "object",
       "properties": {
         "id": {
@@ -49,10 +11,10 @@
           "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "ownerId": {
+        "workspaceId": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
+          "minLength": 16,
+          "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "label": {
@@ -109,7 +71,7 @@
       },
       "required": [
         "id",
-        "ownerId",
+        "workspaceId",
         "label",
         "countryCode",
         "phone",
@@ -125,7 +87,7 @@
     },
     "PublicRedirect": {
       "title": "PublicRedirect",
-      "description": "Publicly resolvable short code redirect mapping without private user metadata.",
+      "description": "Publicly resolvable short code redirect mapping linked to a workspace.",
       "type": "object",
       "properties": {
         "shortCode": {
@@ -134,10 +96,10 @@
           "maxLength": 32,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "ownerId": {
+        "workspaceId": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
+          "minLength": 16,
+          "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "targetUrl": {
@@ -160,7 +122,7 @@
           "format": "date-time"
         }
       },
-      "required": ["shortCode", "ownerId", "targetUrl", "active", "clickCount", "createdAt", "updatedAt"]
+      "required": ["shortCode", "workspaceId", "targetUrl", "active", "clickCount", "createdAt", "updatedAt"]
     },
     "ClickEvent": {
       "title": "ClickEvent",
@@ -179,10 +141,10 @@
           "maxLength": 32,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
-        "ownerId": {
+        "workspaceId": {
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
+          "minLength": 16,
+          "maxLength": 64,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "deviceType": {
@@ -209,25 +171,21 @@
           "format": "date-time"
         }
       },
-      "required": ["clickId", "shortCode", "ownerId", "deviceType", "browser", "os", "referrer", "clickedAt"]
+      "required": ["clickId", "shortCode", "workspaceId", "deviceType", "browser", "os", "referrer", "clickedAt"]
     }
   },
   "firestore": {
-    "/users/{userId}": {
-      "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "Private user profile documents restricted to the owner."
+    "/workspaces/{workspaceId}/links/{linkId}": {
+      "schema": { "$ref": "#/entities/WorkspaceLink" },
+      "description": "Link history per anonymous browser workspace."
     },
-    "/users/{userId}/links/{linkId}": {
-      "schema": { "$ref": "#/entities/UserLink" },
-      "description": "Private history of generated and shortened WhatsApp links per user."
+    "/workspaces/{workspaceId}/clicks/{clickId}": {
+      "schema": { "$ref": "#/entities/ClickEvent" },
+      "description": "Click telemetry events belonging to links in a workspace."
     },
     "/publicRedirects/{shortCode}": {
       "schema": { "$ref": "#/entities/PublicRedirect" },
       "description": "Publicly readable single-document short link redirects (no list access)."
-    },
-    "/publicRedirects/{shortCode}/clicks/{clickId}": {
-      "schema": { "$ref": "#/entities/ClickEvent" },
-      "description": "Click telemetry events linked atomically to a publicRedirect document."
     }
   }
 }

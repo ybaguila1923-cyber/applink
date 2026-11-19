@@ -1,5 +1,5 @@
 import express from 'express';
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import multer from 'multer';
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -22,6 +22,37 @@ const upload = multer({
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+interface CachedMediaTarget {
+  url: string;
+  audioUrl?: string;
+  headers: Record<string, string>;
+  expiresAt: number;
+}
+
+const mediaTokenCache = new Map<string, CachedMediaTarget>();
+
+function cacheMediaTarget(
+  url: string,
+  headers: Record<string, string> = {},
+  audioUrl?: string
+): string {
+  const now = Date.now();
+  for (const [k, v] of mediaTokenCache.entries()) {
+    if (v.expiresAt < now) mediaTokenCache.delete(k);
+  }
+  const token = `tok_${crypto.randomBytes(12).toString('hex')}`;
+  mediaTokenCache.set(token, {
+    url,
+    audioUrl,
+    headers,
+    expiresAt: now + 30 * 60 * 1000,
+  });
+  return token;
+}
 
 function isPrivateOrBlockedHost(hostname: string): boolean {
   const lower = hostname.toLowerCase();
@@ -57,6 +88,27 @@ function validateExternalUrl(raw: string): URL {
   return parsed;
 }
 
+function resolveMediaSource(rawOrToken: string): {
+  url: string;
+  audioUrl?: string;
+  headers: Record<string, string>;
+} {
+  if (rawOrToken.startsWith('tok_')) {
+    const cached = mediaTokenCache.get(rawOrToken);
+    if (!cached || cached.expiresAt < Date.now()) {
+      mediaTokenCache.delete(rawOrToken);
+      throw new Error('El enlace temporal expiró. Analiza la publicación nuevamente.');
+    }
+    validateExternalUrl(cached.url);
+    if (cached.audioUrl) {
+      validateExternalUrl(cached.audioUrl);
+    }
+    return { url: cached.url, audioUrl: cached.audioUrl, headers: cached.headers };
+  }
+  const parsed = validateExternalUrl(rawOrToken);
+  return { url: parsed.toString(), headers: {} };
+}
+
 function sanitizeFilename(name: string, fallbackExt: string): string {
   const cleaned = name
     .replace(/[^a-zA-Z0-9._\-\s]/g, '')
@@ -76,7 +128,12 @@ function extractYouTubeId(rawUrl: string): string | null {
       const id = u.pathname.split('/').filter(Boolean)[0];
       return id && /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null;
     }
-    if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'music.youtube.com') {
+    if (
+      host === 'youtube.com' ||
+      host === 'm.youtube.com' ||
+      host === 'music.youtube.com' ||
+      host === 'youtube-nocookie.com'
+    ) {
       const v = u.searchParams.get('v');
       if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
       const parts = u.pathname.split('/').filter(Boolean);
@@ -94,14 +151,83 @@ function extractYouTubeId(rawUrl: string): string | null {
 function detectPlatform(rawUrl: string): 'youtube' | 'tiktok' | 'instagram' | 'facebook' | 'direct' {
   try {
     const host = new URL(rawUrl).hostname.toLowerCase();
-    if (host.includes('youtube.com') || host.includes('youtu.be')) return 'youtube';
-    if (host.includes('tiktok.com')) return 'tiktok';
-    if (host.includes('instagram.com')) return 'instagram';
-    if (host.includes('facebook.com') || host.includes('fb.watch') || host.includes('fb.com')) return 'facebook';
+    if (host.includes('youtube.com') || host.includes('youtu.be') || host.includes('youtube-nocookie.com')) {
+      return 'youtube';
+    }
+    if (host.includes('tiktok.com') || host.includes('tiktokv.com')) return 'tiktok';
+    if (host.includes('instagram.com') || host.includes('instagr.am') || host.includes('ig.me')) {
+      return 'instagram';
+    }
+    if (host.includes('facebook.com') || host.includes('fb.watch') || host.includes('fb.com')) {
+      return 'facebook';
+    }
   } catch {
     // ignore
   }
   return 'direct';
+}
+
+async function resolveRedirectIfNeeded(parsed: URL): Promise<URL> {
+  const initialPlatform = detectPlatform(parsed.toString());
+  const host = parsed.hostname.toLowerCase();
+  const isShortener = [
+    'bit.ly',
+    'tinyurl.com',
+    't.co',
+    'cutt.ly',
+    'rebrand.ly',
+    'buff.ly',
+    'ow.ly',
+    'rb.gy',
+    'is.gd',
+    'share.google',
+    'fb.watch',
+    'ig.me',
+  ].some((d) => host === d || host.endsWith(`.${d}`));
+
+  if (initialPlatform !== 'direct' && !isShortener && !parsed.pathname.includes('/share/')) {
+    return parsed;
+  }
+
+  try {
+    const resp = await fetch(parsed.toString(), {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(5000),
+    });
+    await resp.body?.cancel();
+    if (resp.url) {
+      return validateExternalUrl(resp.url);
+    }
+  } catch {
+    // Fall back to original URL
+  }
+  return parsed;
+}
+
+function isNonMediaContentType(contentType: string): boolean {
+  const lower = contentType.toLowerCase();
+  return (
+    lower.includes('text/html') ||
+    lower.includes('application/xhtml+xml') ||
+    lower.includes('text/plain') ||
+    lower.includes('application/json') ||
+    lower.includes('application/xml') ||
+    lower.includes('text/xml')
+  );
+}
+
+function bufferLooksLikeTextMarkup(buf: Buffer): boolean {
+  const prefix = buf.subarray(0, 128).toString('utf8').trimStart().toLowerCase();
+  return (
+    prefix.startsWith('<!doctype') ||
+    prefix.startsWith('<html') ||
+    prefix.startsWith('<?xml') ||
+    prefix.startsWith('<head') ||
+    prefix.startsWith('<body') ||
+    prefix.startsWith('{"error')
+  );
 }
 
 interface MediaOption {
@@ -109,7 +235,10 @@ interface MediaOption {
   label: string;
   format: 'mp4' | 'mp3' | 'jpg' | 'm4a' | 'webm';
   quality: string;
+  resolution?: string;
+  dimensions?: string;
   url: string;
+  audioSourceUrl?: string;
   filename: string;
   sizeBytes?: number;
   noWatermark?: boolean;
@@ -144,12 +273,17 @@ app.get('/api/media/thumbnails', async (req: Request, res: Response) => {
     try {
       const oembedResp = await fetch(
         `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`,
-        { signal: AbortSignal.timeout(5000) }
+        { signal: AbortSignal.timeout(4500) }
       );
       if (oembedResp.ok) {
-        const meta = (await oembedResp.json()) as { title?: string; author_name?: string };
-        if (meta.title) title = meta.title;
-        if (meta.author_name) author = meta.author_name;
+        const text = await oembedResp.text();
+        try {
+          const meta = JSON.parse(text) as { title?: string; author_name?: string };
+          if (meta.title) title = meta.title;
+          if (meta.author_name) author = meta.author_name;
+        } catch {
+          // ignore non-JSON
+        }
       }
     } catch {
       // Fallback to generic title
@@ -199,102 +333,211 @@ app.get('/api/media/thumbnails', async (req: Request, res: Response) => {
   }
 });
 
-async function inspectTikTok(rawUrl: string): Promise<InspectResult> {
-  const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(rawUrl)}&hd=1`;
-  const resp = await fetch(apiUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(12000),
-  });
-  if (!resp.ok) {
-    throw new Error('No se pudo conectar con el extractor de TikTok.');
+function parseTikTokResolution(gearName?: string, width?: number, height?: number): {
+  resolution: string;
+  label: string;
+  rank: number;
+} {
+  const shortSide = width && height ? Math.min(width, height) : 0;
+  const g = (gearName || '').toLowerCase();
+  if (shortSide >= 1080 || g.includes('1080')) {
+    return { resolution: '1080p', label: 'Video MP4 Full HD (1080p)', rank: 1080 };
   }
-  const json = (await resp.json()) as {
-    code: number;
-    msg?: string;
-    data?: {
-      title?: string;
-      cover?: string;
-      origin_cover?: string;
+  if (shortSide >= 720 || g.includes('720')) {
+    return { resolution: '720p', label: 'Video MP4 HD (720p)', rank: 720 };
+  }
+  if (shortSide >= 540 || g.includes('540')) {
+    return { resolution: '540p', label: 'Video MP4 Estándar (540p)', rank: 540 };
+  }
+  if (shortSide >= 480 || g.includes('480')) {
+    return { resolution: '480p', label: 'Video MP4 Ligero (480p)', rank: 480 };
+  }
+  return { resolution: 'HD', label: 'Video MP4 Sin Marca de Agua', rank: 600 };
+}
+
+async function inspectTikTok(rawUrl: string): Promise<InspectResult> {
+  const resp = await fetch(rawUrl, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+    },
+    signal: AbortSignal.timeout(8500),
+  });
+
+  if (!resp.ok) {
+    throw new Error('No se pudo acceder a este enlace de TikTok. Verifica que el video sea público.');
+  }
+
+  const rawCookies = typeof resp.headers.getSetCookie === 'function' ? resp.headers.getSetCookie() : [];
+  const cookieHeader = rawCookies.map((c) => c.split(';')[0]).join('; ');
+  const html = await resp.text();
+
+  const match = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match?.[1]) {
+    throw new Error('No se encontraron los datos del video de TikTok (puede requerir verificación o ser privado).');
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(match[1]) as Record<string, unknown>;
+  } catch {
+    throw new Error('No se pudieron interpretar los metadatos de TikTok.');
+  }
+
+  const defaultScope = parsed['__DEFAULT_SCOPE__'] as Record<string, unknown> | undefined;
+  const videoDetail = defaultScope?.['webapp.video-detail'] as Record<string, unknown> | undefined;
+  const itemInfo = videoDetail?.['itemInfo'] as Record<string, unknown> | undefined;
+  const item = itemInfo?.['itemStruct'] as {
+    desc?: string;
+    author?: { nickname?: string; uniqueId?: string };
+    video?: {
       duration?: number;
-      play?: string;
-      hdplay?: string;
-      music?: string;
+      width?: number;
+      height?: number;
       size?: number;
-      hd_size?: number;
-      author?: { nickname?: string; unique_id?: string };
-      images?: string[];
+      cover?: string;
+      originCover?: string;
+      playAddr?: string;
+      downloadAddr?: string;
+      bitrateInfo?: Array<{
+        GearName?: string;
+        PlayAddr?: { UrlList?: string[]; DataSize?: string; Width?: number; Height?: number };
+      }>;
     };
+    music?: { title?: string; playUrl?: string };
+    imagePost?: {
+      images?: Array<{ imageURL?: { urlList?: string[] } }>;
+    };
+  } | undefined;
+
+  if (!item) {
+    throw new Error('Este video de TikTok no está disponible o fue eliminado.');
+  }
+
+  const title = item.desc?.trim() || 'Video de TikTok';
+  const author =
+    item.author?.nickname || (item.author?.uniqueId ? `@${item.author.uniqueId}` : 'TikTok');
+  const thumbnail = item.video?.originCover || item.video?.cover || '';
+  const headers = {
+    Referer: 'https://www.tiktok.com/',
+    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
   };
 
-  if (json.code !== 0 || !json.data) {
-    throw new Error(json.msg || 'No se encontró el video de TikTok o es privado.');
+  const audioToken = item.music?.playUrl ? cacheMediaTarget(item.music.playUrl, headers) : undefined;
+  const videoCandidates: Array<MediaOption & { rank: number }> = [];
+  const seenUrls = new Set<string>();
+  const seenResolutions = new Set<string>();
+
+  if (Array.isArray(item.video?.bitrateInfo)) {
+    for (const b of item.video.bitrateInfo) {
+      const candidateUrl = b.PlayAddr?.UrlList?.[0];
+      if (!candidateUrl || seenUrls.has(candidateUrl)) continue;
+      const w = b.PlayAddr?.Width || item.video?.width;
+      const h = b.PlayAddr?.Height || item.video?.height;
+      const meta = parseTikTokResolution(b.GearName, w, h);
+      if (seenResolutions.has(meta.resolution)) continue;
+      seenUrls.add(candidateUrl);
+      seenResolutions.add(meta.resolution);
+      const token = cacheMediaTarget(candidateUrl, headers);
+      videoCandidates.push({
+        id: `tt-${meta.resolution}-${videoCandidates.length}`,
+        label: meta.label,
+        format: 'mp4',
+        quality: meta.resolution,
+        resolution: meta.resolution,
+        dimensions: w && h ? `${w}×${h}` : undefined,
+        url: token,
+        audioSourceUrl: audioToken,
+        filename: sanitizeFilename(`${title}_tiktok_${meta.resolution}`, 'mp4'),
+        sizeBytes: b.PlayAddr?.DataSize ? Number(b.PlayAddr.DataSize) : undefined,
+        noWatermark: true,
+        canConvertMp3: true,
+        rank: meta.rank,
+      });
+    }
   }
 
-  const d = json.data;
-  const title = d.title?.trim() || 'Video de TikTok';
-  const author = d.author?.nickname || (d.author?.unique_id ? `@${d.author.unique_id}` : 'TikTok');
-  const options: MediaOption[] = [];
+  if (item.video?.playAddr && !seenUrls.has(item.video.playAddr)) {
+    const w = item.video?.width;
+    const h = item.video?.height;
+    const meta = parseTikTokResolution('original', w, h);
+    if (!seenResolutions.has(meta.resolution) || videoCandidates.length === 0) {
+      const token = cacheMediaTarget(item.video.playAddr, headers);
+      videoCandidates.push({
+        id: 'tt-no-wm',
+        label: 'Video MP4 Original (Sin Marca de Agua)',
+        format: 'mp4',
+        quality: meta.resolution,
+        resolution: meta.resolution,
+        dimensions: w && h ? `${w}×${h}` : undefined,
+        url: token,
+        audioSourceUrl: audioToken,
+        filename: sanitizeFilename(`${title}_tiktok`, 'mp4'),
+        sizeBytes: item.video?.size ? Number(item.video.size) : undefined,
+        noWatermark: true,
+        canConvertMp3: true,
+        rank: meta.rank + 1,
+      });
+    }
+  }
 
-  if (d.hdplay) {
+  videoCandidates.sort((a, b) => b.rank - a.rank);
+  const options: MediaOption[] = videoCandidates.map(({ rank: _rank, ...rest }) => rest);
+
+  if (audioToken && item.music?.playUrl) {
     options.push({
-      id: 'tt-hd',
-      label: 'Video HD Sin Marca de Agua',
-      format: 'mp4',
-      quality: 'HD MP4',
-      url: d.hdplay,
-      filename: sanitizeFilename(`${title}_tiktok_hd`, 'mp4'),
-      sizeBytes: d.hd_size,
-      noWatermark: true,
-      canConvertMp3: true,
-    });
-  }
-  if (d.play && d.play !== d.hdplay) {
-    options.push({
-      id: 'tt-sd',
-      label: 'Video MP4 Sin Marca de Agua',
-      format: 'mp4',
-      quality: 'MP4 Estándar',
-      url: d.play,
-      filename: sanitizeFilename(`${title}_tiktok`, 'mp4'),
-      sizeBytes: d.size,
-      noWatermark: true,
-      canConvertMp3: true,
-    });
-  }
-  if (d.music) {
-    options.push({
-      id: 'tt-mp3',
-      label: 'Audio Original Extraído',
+      id: 'tt-music',
+      label: `Audio Original (${item.music.title || 'Sonido'})`,
       format: 'mp3',
-      quality: 'MP3 Audio',
-      url: d.music,
+      quality: 'MP3 Original',
+      resolution: 'Audio',
+      url: audioToken,
       filename: sanitizeFilename(`${title}_audio`, 'mp3'),
     });
   }
-  if (Array.isArray(d.images)) {
-    d.images.forEach((imgUrl, idx) => {
-      options.push({
-        id: `tt-img-${idx}`,
-        label: `Imagen de Carrusel #${idx + 1}`,
-        format: 'jpg',
-        quality: 'JPG Original',
-        url: imgUrl,
-        filename: sanitizeFilename(`${title}_slide_${idx + 1}`, 'jpg'),
-      });
+
+  if (Array.isArray(item.imagePost?.images)) {
+    item.imagePost.images.forEach((img, idx) => {
+      const imgUrl = img.imageURL?.urlList?.[0];
+      if (imgUrl) {
+        const token = cacheMediaTarget(imgUrl, headers);
+        options.push({
+          id: `tt-img-${idx}`,
+          label: `Imagen de Carrusel #${idx + 1}`,
+          format: 'jpg',
+          quality: 'JPG Original',
+          url: token,
+          filename: sanitizeFilename(`${title}_slide_${idx + 1}`, 'jpg'),
+        });
+      }
     });
+  }
+
+  if (options.length === 0) {
+    throw new Error('No se encontraron flujos descargables en este enlace de TikTok.');
   }
 
   return {
     platform: 'tiktok',
     title,
     author,
-    thumbnail: d.origin_cover || d.cover || '',
-    durationSec: d.duration,
+    thumbnail,
+    durationSec: item.video?.duration,
     options,
   };
+}
+
+interface AdaptiveFormatLike {
+  itag?: number;
+  url?: string;
+  mime_type?: string;
+  quality_label?: string;
+  width?: number;
+  height?: number;
+  bitrate?: number;
+  content_length?: number | string;
+  decipher?: (player: unknown) => Promise<string>;
 }
 
 async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
@@ -305,18 +548,22 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
 
   let title = `YouTube Video (${videoId})`;
   let author = 'YouTube';
-  let thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
   try {
     const oembed = await fetch(
       `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`,
-      { signal: AbortSignal.timeout(5000) }
+      { signal: AbortSignal.timeout(4500) }
     );
     if (oembed.ok) {
-      const meta = (await oembed.json()) as { title?: string; author_name?: string; thumbnail_url?: string };
-      if (meta.title) title = meta.title;
-      if (meta.author_name) author = meta.author_name;
-      if (meta.thumbnail_url) thumbnail = meta.thumbnail_url;
+      const rawText = await oembed.text();
+      try {
+        const meta = JSON.parse(rawText) as { title?: string; author_name?: string };
+        if (meta.title) title = meta.title;
+        if (meta.author_name) author = meta.author_name;
+      } catch {
+        // ignore
+      }
     }
   } catch {
     // ignore
@@ -327,68 +574,166 @@ async function inspectYouTube(rawUrl: string): Promise<InspectResult> {
   let durationSec: number | undefined;
 
   try {
-    const yt = await Innertube.create({ generate_session_locally: true });
-    const info = await yt.getBasicInfo(videoId);
-    if (info.basic_info.title) title = info.basic_info.title;
-    if (info.basic_info.author) author = info.basic_info.author;
-    if (info.basic_info.duration) durationSec = info.basic_info.duration;
+    const cookie = process.env.YOUTUBE_COOKIE?.trim();
+    const yt = await Innertube.create({
+      generate_session_locally: true,
+      ...(cookie ? { cookie } : {}),
+    });
 
-    const streaming = info.streaming_data;
+    interface StreamingDataLike {
+      formats?: AdaptiveFormatLike[];
+      adaptive_formats?: AdaptiveFormatLike[];
+    }
+
+    const clientsToTry = ['IOS', 'ANDROID', 'MWEB', 'ANDROID_VR'] as const;
+    let streaming: StreamingDataLike | null = null;
+
+    for (const client of clientsToTry) {
+      try {
+        const info = await yt.getBasicInfo(videoId, { client });
+        if (info.basic_info?.title) title = info.basic_info.title;
+        if (info.basic_info?.author) author = info.basic_info.author;
+        if (info.basic_info?.duration) durationSec = info.basic_info.duration;
+
+        const candidate = info.streaming_data;
+        const count =
+          (candidate?.formats?.length || 0) + (candidate?.adaptive_formats?.length || 0);
+        if (candidate && count > 0) {
+          streaming = candidate as unknown as StreamingDataLike;
+          break;
+        }
+      } catch {
+        // Try next client
+      }
+    }
+
     if (streaming) {
-      const combined = streaming.formats || [];
-      for (const fmt of combined) {
-        const directUrl = await fmt.decipher(yt.session.player);
-        if (directUrl) {
-          options.push({
-            id: `yt-fmt-${fmt.itag}`,
-            label: `Video MP4 (${fmt.quality_label || 'Estándar'})`,
-            format: 'mp4',
-            quality: fmt.quality_label || 'MP4',
-            url: directUrl,
-            filename: sanitizeFilename(`${title}_${fmt.quality_label || 'video'}`, 'mp4'),
-            sizeBytes: fmt.content_length ? Number(fmt.content_length) : undefined,
-            canConvertMp3: true,
-          });
+      const adaptive = streaming.adaptive_formats || [];
+      const audioFormats = adaptive
+        .filter((f) => String(f.mime_type || '').startsWith('audio/'))
+        .sort((a, b) => {
+          const aMp4 = String(a.mime_type || '').includes('audio/mp4') ? 1 : 0;
+          const bMp4 = String(b.mime_type || '').includes('audio/mp4') ? 1 : 0;
+          if (aMp4 !== bMp4) return bMp4 - aMp4;
+          return (b.bitrate || 0) - (a.bitrate || 0);
+        });
+
+      let bestAudioUrl = '';
+      let bestAudioSize = 0;
+      let bestAudioBitrate = 128000;
+      for (const af of audioFormats) {
+        const resolved = af.url || (af.decipher ? await af.decipher(yt.session.player).catch(() => '') : '');
+        if (resolved) {
+          bestAudioUrl = resolved;
+          bestAudioSize = af.content_length ? Number(af.content_length) : 0;
+          bestAudioBitrate = af.bitrate || 128000;
+          break;
         }
       }
-      const audioFormats = (streaming.adaptive_formats || []).filter((f) =>
-        String(f.mime_type || '').startsWith('audio/')
-      );
-      if (audioFormats.length > 0) {
-        const bestAudio = audioFormats[0];
-        const audioUrl = await bestAudio.decipher(yt.session.player);
-        if (audioUrl) {
-          options.push({
-            id: `yt-audio-${bestAudio.itag}`,
-            label: 'Pista de Audio (Convertible a MP3)',
-            format: 'm4a',
-            quality: `${Math.round((bestAudio.bitrate || 128000) / 1000)} kbps`,
-            url: audioUrl,
-            filename: sanitizeFilename(`${title}_audio`, 'm4a'),
-            sizeBytes: bestAudio.content_length ? Number(bestAudio.content_length) : undefined,
-            canConvertMp3: true,
-          });
+
+      const audioToken = bestAudioUrl ? cacheMediaTarget(bestAudioUrl, {}) : undefined;
+
+      // Collect HD adaptive MP4 streams (1080p, 720p, 480p, 360p) muxed with audio
+      const videoAdaptive = adaptive
+        .filter((f) => String(f.mime_type || '').startsWith('video/mp4'))
+        .sort((a, b) => {
+          const aAvc = String(a.mime_type || '').includes('avc1') ? 1 : 0;
+          const bAvc = String(b.mime_type || '').includes('avc1') ? 1 : 0;
+          if (aAvc !== bAvc) return bAvc - aAvc;
+          return (b.height || 0) - (a.height || 0);
+        });
+
+      const seenResolutions = new Set<string>();
+      const collectedVideos: Array<MediaOption & { heightRank: number }> = [];
+
+      for (const vf of videoAdaptive) {
+        const height = vf.height || 0;
+        const rawRes = vf.quality_label || (height ? `${height}p` : '');
+        const normResMatch = rawRes.match(/(\d+p)/i);
+        const normRes = normResMatch ? normResMatch[1].toLowerCase() : rawRes;
+        if (!normRes || !['2160p', '1440p', '1080p', '720p', '480p', '360p'].includes(normRes)) {
+          continue;
         }
+        if (seenResolutions.has(normRes)) continue;
+
+        const videoUrl = vf.url || (vf.decipher ? await vf.decipher(yt.session.player).catch(() => '') : '');
+        if (!videoUrl) continue;
+
+        seenResolutions.add(normRes);
+        const token = cacheMediaTarget(videoUrl, {}, bestAudioUrl || undefined);
+        const vSize = vf.content_length ? Number(vf.content_length) : 0;
+        const totalSize = vSize > 0 ? vSize + bestAudioSize : undefined;
+
+        collectedVideos.push({
+          id: `yt-hd-${normRes}-${vf.itag || collectedVideos.length}`,
+          label: `Video MP4 (${normRes.toUpperCase()})`,
+          format: 'mp4',
+          quality: normRes,
+          resolution: normRes,
+          dimensions: vf.width && vf.height ? `${vf.width}×${vf.height}` : undefined,
+          url: token,
+          audioSourceUrl: audioToken,
+          filename: sanitizeFilename(`${title}_${normRes}`, 'mp4'),
+          sizeBytes: totalSize,
+          canConvertMp3: true,
+          heightRank: height || parseInt(normRes, 10) || 0,
+        });
+      }
+
+      // Also include combined progressive formats if that resolution wasn't already covered
+      for (const fmt of streaming.formats || []) {
+        const rawRes = fmt.quality_label || '360p';
+        const normResMatch = rawRes.match(/(\d+p)/i);
+        const normRes = normResMatch ? normResMatch[1].toLowerCase() : rawRes;
+        if (seenResolutions.has(normRes)) continue;
+        const directUrl = fmt.url || (fmt.decipher ? await fmt.decipher(yt.session.player).catch(() => '') : '');
+        if (!directUrl) continue;
+        seenResolutions.add(normRes);
+        const token = cacheMediaTarget(directUrl, {});
+        collectedVideos.push({
+          id: `yt-fmt-${fmt.itag || normRes}`,
+          label: `Video MP4 (${normRes.toUpperCase()})`,
+          format: 'mp4',
+          quality: normRes,
+          resolution: normRes,
+          dimensions: fmt.width && fmt.height ? `${fmt.width}×${fmt.height}` : undefined,
+          url: token,
+          audioSourceUrl: audioToken,
+          filename: sanitizeFilename(`${title}_${normRes}`, 'mp4'),
+          sizeBytes: fmt.content_length ? Number(fmt.content_length) : undefined,
+          canConvertMp3: true,
+          heightRank: fmt.height || parseInt(normRes, 10) || 360,
+        });
+      }
+
+      collectedVideos.sort((a, b) => b.heightRank - a.heightRank);
+      for (const { heightRank: _hr, ...opt } of collectedVideos) {
+        options.push(opt);
+      }
+
+      if (audioToken) {
+        options.push({
+          id: `yt-audio-best`,
+          label: 'Pista de Audio Directa (Convertible a MP3)',
+          format: 'm4a',
+          quality: `${Math.round(bestAudioBitrate / 1000)} kbps`,
+          resolution: 'Audio',
+          url: audioToken,
+          filename: sanitizeFilename(`${title}_audio`, 'm4a'),
+          sizeBytes: bestAudioSize || undefined,
+          canConvertMp3: true,
+        });
       }
     }
   } catch {
     warning =
-      'YouTube restringió la extracción directa del flujo desde esta IP de servidor. Puedes descargar todas las miniaturas HD al instante o convertir a MP3 subiendo el archivo en la pestaña Conversor MP3.';
+      'YouTube solicitó verificación anti-bots desde el servidor para este video. Prueba con otro enlace (TikTok, Facebook, Instagram) o descarga su miniatura en la pestaña Miniaturas YouTube.';
   }
 
   if (options.length === 0 && !warning) {
     warning =
-      'YouTube no devolvió flujos directos descargables para este enlace en este momento. Las miniaturas HD están disponibles.';
+      'YouTube bloqueó temporalmente la extracción directa de video/audio desde la nube para este enlace (verificación anti-bots). Puedes descargar sus miniaturas HD en la pestaña Miniaturas YouTube o convertir un archivo local en el Conversor a MP3.';
   }
-
-  options.push({
-    id: `yt-thumb-${videoId}`,
-    label: 'Miniatura HD del Video',
-    format: 'jpg',
-    quality: '1280×720 / HQ',
-    url: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    filename: sanitizeFilename(`${title}_miniatura`, 'jpg'),
-  });
 
   return {
     platform: 'youtube',
@@ -409,7 +754,7 @@ function unescapeEmbeddedUrl(raw: string): string {
 }
 
 async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
-  const match = rawUrl.match(/instagram\.com\/(?:p|reel|tv)\/([a-zA-Z0-9_-]+)/i);
+  const match = rawUrl.match(/(?:instagram\.com|instagr\.am)\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/i);
   if (!match) {
     throw new Error('Ingresa un enlace válido de publicación o Reel de Instagram (/p/ o /reel/).');
   }
@@ -417,11 +762,10 @@ async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
   const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
   const resp = await fetch(embedUrl, {
     headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'User-Agent': BROWSER_UA,
       'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
     },
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!resp.ok) {
@@ -437,12 +781,14 @@ async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
     const clean = unescapeEmbeddedUrl(m[1]);
     if (clean.startsWith('http') && !seenUrls.has(clean)) {
       seenUrls.add(clean);
+      const token = cacheMediaTarget(clean, { Referer: 'https://www.instagram.com/' });
       options.push({
         id: `ig-vid-${options.length + 1}`,
-        label: `Video / Reel #${options.length + 1}`,
+        label: `Video / Reel MP4 #${options.length + 1}`,
         format: 'mp4',
         quality: 'MP4 Original',
-        url: clean,
+        resolution: 'HD',
+        url: token,
         filename: sanitizeFilename(`instagram_${shortcode}_${options.length + 1}`, 'mp4'),
         canConvertMp3: true,
       });
@@ -454,28 +800,34 @@ async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
     const clean = unescapeEmbeddedUrl(m[1]);
     if (clean.startsWith('http') && !seenUrls.has(clean)) {
       seenUrls.add(clean);
+      const token = cacheMediaTarget(clean, { Referer: 'https://www.instagram.com/' });
       options.push({
         id: `ig-img-${options.length + 1}`,
         label: `Imagen de Publicación #${options.length + 1}`,
         format: 'jpg',
         quality: 'Alta Resolución',
-        url: clean,
+        url: token,
         filename: sanitizeFilename(`instagram_${shortcode}_${options.length + 1}`, 'jpg'),
       });
     }
   }
 
-  // Fallback to EmbeddedMediaImage in embed HTML
+  let previewThumb = '';
+  const firstDisplay = html.match(/"display_url"\s*:\s*"([^"]+)"/);
+  if (firstDisplay?.[1]) previewThumb = unescapeEmbeddedUrl(firstDisplay[1]);
+
   if (options.length === 0) {
     const fallbackImg = html.match(/class="EmbeddedMediaImage"[^>]+src="([^"]+)"/i);
-    if (fallbackImg && fallbackImg[1]) {
+    if (fallbackImg?.[1]) {
       const clean = unescapeEmbeddedUrl(fallbackImg[1]);
+      previewThumb = clean;
+      const token = cacheMediaTarget(clean, { Referer: 'https://www.instagram.com/' });
       options.push({
         id: 'ig-img-1',
         label: 'Imagen de Instagram',
         format: 'jpg',
         quality: 'JPG',
-        url: clean,
+        url: token,
         filename: sanitizeFilename(`instagram_${shortcode}`, 'jpg'),
       });
     }
@@ -488,7 +840,7 @@ async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
 
   if (options.length === 0) {
     throw new Error(
-      'No se encontraron imágenes o videos públicos en este enlace. Es posible que la cuenta sea privada o requiera sesión.'
+      'No se encontraron imágenes o videos públicos en este enlace. Es posible que la cuenta sea privada o requiera inicio de sesión.'
     );
   }
 
@@ -496,7 +848,7 @@ async function inspectInstagram(rawUrl: string): Promise<InspectResult> {
     platform: 'instagram',
     title,
     author,
-    thumbnail: options.find((o) => o.format === 'jpg')?.url || '',
+    thumbnail: previewThumb,
     options,
   };
 }
@@ -505,12 +857,11 @@ async function inspectFacebook(rawUrl: string): Promise<InspectResult> {
   const resp = await fetch(rawUrl, {
     redirect: 'follow',
     headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'User-Agent': BROWSER_UA,
       Accept: 'text/html,application/xhtml+xml',
       'Accept-Language': 'es-ES,es;q=0.9',
     },
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!resp.ok) {
@@ -532,13 +883,15 @@ async function inspectFacebook(rawUrl: string): Promise<InspectResult> {
       const clean = unescapeEmbeddedUrl(m[1]);
       if (clean.startsWith('http') && !seen.has(clean)) {
         seen.add(clean);
+        const token = cacheMediaTarget(clean, { Referer: 'https://www.facebook.com/' });
         options.push({
           id: 'fb-hd',
-          label: 'Video Facebook HD',
+          label: 'Video MP4 Alta Definición (720p HD)',
           format: 'mp4',
-          quality: 'HD MP4',
-          url: clean,
-          filename: sanitizeFilename(`facebook_hd_${Date.now()}`, 'mp4'),
+          quality: '720p HD',
+          resolution: '720p',
+          url: token,
+          filename: sanitizeFilename(`facebook_720p_${Date.now()}`, 'mp4'),
           canConvertMp3: true,
         });
         break;
@@ -558,13 +911,15 @@ async function inspectFacebook(rawUrl: string): Promise<InspectResult> {
       const clean = unescapeEmbeddedUrl(m[1]);
       if (clean.startsWith('http') && !seen.has(clean)) {
         seen.add(clean);
+        const token = cacheMediaTarget(clean, { Referer: 'https://www.facebook.com/' });
         options.push({
           id: 'fb-sd',
-          label: 'Video Facebook Estándar',
+          label: 'Video MP4 Estándar (480p SD)',
           format: 'mp4',
-          quality: 'SD MP4',
-          url: clean,
-          filename: sanitizeFilename(`facebook_sd_${Date.now()}`, 'mp4'),
+          quality: '480p SD',
+          resolution: '480p',
+          url: token,
+          filename: sanitizeFilename(`facebook_480p_${Date.now()}`, 'mp4'),
           canConvertMp3: true,
         });
         break;
@@ -590,6 +945,69 @@ async function inspectFacebook(rawUrl: string): Promise<InspectResult> {
   };
 }
 
+async function inspectDirectMedia(parsed: URL): Promise<InspectResult> {
+  let contentType = '';
+  let sizeBytes: number | undefined;
+
+  try {
+    const head = await fetch(parsed.toString(), {
+      method: 'HEAD',
+      redirect: 'follow',
+      headers: { 'User-Agent': BROWSER_UA },
+      signal: AbortSignal.timeout(5500),
+    });
+    if (head.ok) {
+      contentType = head.headers.get('content-type') || '';
+      const len = head.headers.get('content-length');
+      if (len) sizeBytes = parseInt(len, 10) || undefined;
+    } else if (head.status === 405 || head.status === 403) {
+      const probe = await fetch(parsed.toString(), {
+        method: 'GET',
+        headers: { 'User-Agent': BROWSER_UA, Range: 'bytes=0-1023' },
+        signal: AbortSignal.timeout(5500),
+      });
+      contentType = probe.headers.get('content-type') || '';
+      await probe.body?.cancel();
+    }
+  } catch {
+    throw new Error('No se pudo conectar con la URL proporcionada para verificar el archivo.');
+  }
+
+  if (contentType && isNonMediaContentType(contentType)) {
+    throw new Error(
+      'Este enlace apunta a una página web HTML y no a un archivo de video o audio directo (.mp4, .mp3, .m4a, .webm). Pega una URL de YouTube, TikTok, Facebook, Instagram o un archivo multimedia directo.'
+    );
+  }
+
+  const ext = path.extname(parsed.pathname).replace('.', '').toLowerCase();
+  let format: MediaOption['format'] = 'mp4';
+  if (contentType.includes('audio/mpeg') || ext === 'mp3') format = 'mp3';
+  else if (contentType.includes('audio/mp4') || ext === 'm4a') format = 'm4a';
+  else if (contentType.includes('video/webm') || ext === 'webm') format = 'webm';
+  else if (contentType.includes('image/') || ['jpg', 'jpeg', 'png', 'webp'].includes(ext)) format = 'jpg';
+
+  const baseTitle = path.basename(parsed.pathname, `.${ext}`) || 'Archivo Multimedia Directo';
+  return {
+    platform: 'direct',
+    title: baseTitle,
+    author: parsed.hostname,
+    thumbnail: format === 'jpg' ? parsed.toString() : '',
+    options: [
+      {
+        id: 'direct-1',
+        label: `Archivo Directo (${format.toUpperCase()})`,
+        format,
+        quality: 'Original',
+        resolution: 'Original',
+        url: parsed.toString(),
+        filename: sanitizeFilename(baseTitle, format),
+        sizeBytes,
+        canConvertMp3: format !== 'jpg' && format !== 'mp3',
+      },
+    ],
+  };
+}
+
 app.post('/api/media/inspect', async (req: Request, res: Response) => {
   try {
     const rawUrl = String(req.body?.url || '').trim();
@@ -597,7 +1015,8 @@ app.post('/api/media/inspect', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'Pega un enlace válido para analizar.' });
       return;
     }
-    const parsed = validateExternalUrl(rawUrl);
+    const initialParsed = validateExternalUrl(rawUrl);
+    const parsed = await resolveRedirectIfNeeded(initialParsed);
     const platform = detectPlatform(parsed.toString());
 
     let result: InspectResult;
@@ -610,25 +1029,7 @@ app.post('/api/media/inspect', async (req: Request, res: Response) => {
     } else if (platform === 'facebook') {
       result = await inspectFacebook(parsed.toString());
     } else {
-      const ext = path.extname(parsed.pathname).replace('.', '').toLowerCase();
-      const format = (['mp4', 'mp3', 'jpg', 'm4a', 'webm'].includes(ext) ? ext : 'mp4') as MediaOption['format'];
-      result = {
-        platform: 'direct',
-        title: path.basename(parsed.pathname) || 'Archivo Multimedia Directo',
-        author: parsed.hostname,
-        thumbnail: format === 'jpg' ? parsed.toString() : '',
-        options: [
-          {
-            id: 'direct-1',
-            label: `Archivo Directo (${format.toUpperCase()})`,
-            format,
-            quality: 'Original',
-            url: parsed.toString(),
-            filename: sanitizeFilename(path.basename(parsed.pathname, `.${ext}`) || 'media', format),
-            canConvertMp3: format !== 'jpg' && format !== 'mp3',
-          },
-        ],
-      };
+      result = await inspectDirectMedia(parsed);
     }
 
     res.json(result);
@@ -639,22 +1040,139 @@ app.post('/api/media/inspect', async (req: Request, res: Response) => {
   }
 });
 
+async function fetchUrlToFile(
+  targetUrl: string,
+  extraHeaders: Record<string, string>,
+  outPath: string,
+  maxBytes = 200 * 1024 * 1024
+): Promise<{ contentType: string; sizeBytes: number }> {
+  const isYoutubeCdn = targetUrl.includes('googlevideo.com');
+  const resp = await fetch(targetUrl, {
+    headers: {
+      'User-Agent': BROWSER_UA,
+      ...(isYoutubeCdn ? { Range: `bytes=0-${maxBytes - 1}` } : {}),
+      ...extraHeaders,
+    },
+    signal: AbortSignal.timeout(90000),
+  });
+  if (!resp.ok || !resp.body) {
+    throw new Error(`El servidor remoto respondió con código ${resp.status}.`);
+  }
+  const contentType = resp.headers.get('content-type') || 'application/octet-stream';
+  if (isNonMediaContentType(contentType)) {
+    throw new Error('El origen devolvió una página web en lugar de un flujo multimedia.');
+  }
+  const arrayBuf = await resp.arrayBuffer();
+  if (arrayBuf.byteLength > maxBytes) {
+    throw new Error('El archivo supera el límite máximo permitido.');
+  }
+  const buf = Buffer.from(arrayBuf);
+  if (buf.byteLength < 256 || bufferLooksLikeTextMarkup(buf)) {
+    throw new Error('El enlace no entregó datos de audio o video válidos.');
+  }
+  fs.writeFileSync(outPath, buf);
+  return { contentType, sizeBytes: buf.byteLength };
+}
+
+function runFfmpegMuxMp4(
+  videoPath: string,
+  audioPath: string,
+  outputPath: string,
+  audioCodec: 'copy' | 'aac' = 'copy'
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y',
+      '-i',
+      videoPath,
+      '-i',
+      audioPath,
+      '-c:v',
+      'copy',
+      '-c:a',
+      audioCodec,
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      outputPath,
+    ]);
+    let stderr = '';
+    ff.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    ff.on('error', (err) => reject(err));
+    ff.on('close', (code) => {
+      if (code === 0 && fs.existsSync(outputPath)) {
+        resolve();
+      } else {
+        reject(new Error(stderr));
+      }
+    });
+  });
+}
+
 app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
+  const tempFiles: string[] = [];
+  const cleanup = () => {
+    for (const f of tempFiles) {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   try {
-    const rawUrl = String(req.query.url || '').trim();
+    const rawSource = String(req.query.url || '').trim();
     const rawName = String(req.query.filename || 'descarga').trim();
-    if (!rawUrl) {
-      res.status(400).json({ error: 'Falta la URL de descarga.' });
+    if (!rawSource) {
+      res.status(400).json({ error: 'Falta la URL o token de descarga.' });
       return;
     }
-    const parsed = validateExternalUrl(rawUrl);
 
-    const upstream = await fetch(parsed.toString(), {
+    const { url: targetUrl, audioUrl, headers: extraHeaders } = resolveMediaSource(rawSource);
+
+    // If this token pairs adaptive HD video + audio, mux cleanly into a playable MP4
+    if (audioUrl) {
+      const vidPath = path.join(TEMP_DIR, `vid_${crypto.randomUUID()}.mp4`);
+      const audPath = path.join(TEMP_DIR, `aud_${crypto.randomUUID()}.m4a`);
+      const outPath = path.join(TEMP_DIR, `mux_${crypto.randomUUID()}.mp4`);
+      tempFiles.push(vidPath, audPath, outPath);
+
+      await Promise.all([
+        fetchUrlToFile(targetUrl, extraHeaders, vidPath),
+        fetchUrlToFile(audioUrl, extraHeaders, audPath),
+      ]);
+
+      try {
+        await runFfmpegMuxMp4(vidPath, audPath, outPath, 'copy');
+      } catch {
+        await runFfmpegMuxMp4(vidPath, audPath, outPath, 'aac');
+      }
+
+      const stat = fs.statSync(outPath);
+      const safeName = sanitizeFilename(rawName, 'mp4');
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+
+      const stream = fs.createReadStream(outPath);
+      stream.on('close', cleanup);
+      stream.on('error', cleanup);
+      stream.pipe(res);
+      return;
+    }
+
+    const isYoutubeCdn = targetUrl.includes('googlevideo.com');
+    const upstream = await fetch(targetUrl, {
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': BROWSER_UA,
+        ...(isYoutubeCdn ? { Range: 'bytes=0-199999999' } : {}),
+        ...extraHeaders,
       },
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(90000),
     });
 
     if (!upstream.ok || !upstream.body) {
@@ -663,6 +1181,13 @@ app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
     }
 
     const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    if (isNonMediaContentType(contentType)) {
+      res.status(400).json({
+        error: 'El enlace devolvió una página web en lugar de un archivo descargable.',
+      });
+      return;
+    }
+
     const contentLength = upstream.headers.get('content-length');
     const ext = contentType.includes('image/jpeg')
       ? 'jpg'
@@ -670,6 +1195,8 @@ app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
       ? 'png'
       : contentType.includes('audio/mpeg')
       ? 'mp3'
+      : contentType.includes('audio/mp4')
+      ? 'm4a'
       : 'mp4';
 
     const safeName = sanitizeFilename(rawName, ext);
@@ -694,11 +1221,32 @@ app.get('/api/media/proxy-download', async (req: Request, res: Response) => {
     };
     await pump();
   } catch (err) {
+    cleanup();
     if (!res.headersSent) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'Error al descargar el archivo.' });
     }
   }
 });
+
+function extractCleanFfmpegError(stderr: string): string {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const meaningful = [...lines]
+    .reverse()
+    .find(
+      (l) =>
+        !l.startsWith('lib') &&
+        !l.startsWith('configuration:') &&
+        !l.startsWith('built with') &&
+        !l.startsWith('ffmpeg version')
+    );
+  if (meaningful?.includes('Invalid data found')) {
+    return 'El archivo o enlace no contiene una pista de audio/video válida que FFmpeg pueda decodificar.';
+  }
+  return meaningful ? `No se pudo convertir el audio a MP3 (${meaningful.slice(0, 140)}).` : 'FFmpeg no pudo convertir este archivo a MP3.';
+}
 
 function runFfmpegToMp3(inputPath: string, outputPath: string, bitrate: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -727,7 +1275,7 @@ function runFfmpegToMp3(inputPath: string, outputPath: string, bitrate: string):
       if (code === 0 && fs.existsSync(outputPath)) {
         resolve();
       } else {
-        reject(new Error(`FFmpeg falló al convertir a MP3: ${stderr.slice(-240)}`));
+        reject(new Error(extractCleanFfmpegError(stderr)));
       }
     });
   });
@@ -755,24 +1303,13 @@ app.post('/api/media/convert-mp3', upload.single('file'), async (req: Request, r
       tempFiles.push(inputPath);
       baseName = path.basename(req.file.originalname, path.extname(req.file.originalname)) || 'audio_convertido';
     } else if (req.body?.url) {
-      const parsed = validateExternalUrl(String(req.body.url));
-      baseName = String(req.body?.filename || path.basename(parsed.pathname, path.extname(parsed.pathname)) || 'audio_convertido');
-      const dlResp = await fetch(parsed.toString(), {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-        signal: AbortSignal.timeout(45000),
-      });
-      if (!dlResp.ok || !dlResp.body) {
-        throw new Error('No se pudo descargar el medio remoto para convertir a MP3.');
-      }
+      const rawSource = String(req.body.url).trim();
+      const { url: targetUrl, headers: extraHeaders } = resolveMediaSource(rawSource);
+      baseName = String(req.body?.filename || 'audio_convertido');
+
       inputPath = path.join(TEMP_DIR, `in_${crypto.randomUUID()}.bin`);
       tempFiles.push(inputPath);
-      const arrayBuf = await dlResp.arrayBuffer();
-      if (arrayBuf.byteLength > 150 * 1024 * 1024) {
-        throw new Error('El archivo supera el límite máximo de 150 MB.');
-      }
-      fs.writeFileSync(inputPath, Buffer.from(arrayBuf));
+      await fetchUrlToFile(targetUrl, extraHeaders, inputPath, 150 * 1024 * 1024);
     } else {
       res.status(400).json({ error: 'Sube un archivo de video/audio o indica una URL directa.' });
       return;
@@ -799,6 +1336,13 @@ app.post('/api/media/convert-mp3', upload.single('file'), async (req: Request, r
       error: err instanceof Error ? err.message : 'Error al convertir el audio a MP3.',
     });
   }
+});
+
+// Ensure /api/* errors always return JSON rather than plain HTML error pages
+app.use('/api', (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  res.status(500).json({
+    error: err instanceof Error ? err.message : 'Error interno en el servidor multimedia.',
+  });
 });
 
 async function startServer() {

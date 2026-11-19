@@ -1,19 +1,23 @@
 @import "tailwindcss";
 
 @theme {
-  --font-display: "Outfit", system-ui, sans-serif;
-  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-display: "Montserrat", system-ui, sans-serif;
+  --font-sans: "Montserrat", system-ui, sans-serif;
+  --font-mono: "Montserrat", system-ui, sans-serif;
 }
 
 @layer base {
-  html {
-    font-family: var(--font-sans);
+  html,
+  body {
+    font-family: "Montserrat", system-ui, sans-serif;
+    font-size: 18px;
+    color: #000000;
     -webkit-tap-highlight-color: transparent;
   }
 
   h1, h2, h3, .font-display {
-    font-family: var(--font-display);
+    font-family: "Montserrat", system-ui, sans-serif;
+    color: #000000;
   }
 
   .tabular-nums {

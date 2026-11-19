@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { User } from 'firebase/auth';
 import {
   collection,
   doc,
@@ -15,17 +14,15 @@ import {
   BarChart3,
   Check,
   Copy,
-  Download,
   ExternalLink,
+  KeyRound,
   Link2,
   Loader2,
-  LogIn,
-  MessageSquare,
   Pause,
   Play,
   QrCode,
-  Search,
   Scissors,
+  Search,
   Trash2,
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
@@ -34,16 +31,17 @@ import {
   COUNTRY_CODES,
   generateShortCode,
   isValidShortCode,
+  isValidWorkspaceId,
   parseWhatsAppFormatting,
   sanitizeDigits,
+  saveWorkspaceId,
 } from '../lib/whatsapp';
 import type { PublicRedirect, UserLink } from '../types/app';
 import { ClickAnalyticsPanel } from './ClickAnalyticsPanel';
 
 interface WhatsAppSectionProps {
-  user: User | null;
-  authLoading: boolean;
-  onSignIn: () => Promise<void>;
+  workspaceId: string;
+  onChangeWorkspaceId: (nextId: string) => void;
   focusAnalytics?: boolean;
 }
 
@@ -63,9 +61,8 @@ const MESSAGE_TEMPLATES = [
 ];
 
 export function WhatsAppSection({
-  user,
-  authLoading,
-  onSignIn,
+  workspaceId,
+  onChangeWorkspaceId,
   focusAnalytics = false,
 }: WhatsAppSectionProps) {
   const [countryCode, setCountryCode] = useState('52');
@@ -90,6 +87,10 @@ export function WhatsAppSection({
   const [filterMode, setFilterMode] = useState<'all' | 'shortened' | 'direct'>('all');
   const [selectedAnalyticsLinkId, setSelectedAnalyticsLinkId] = useState<string | null>(null);
 
+  const [showWorkspaceTools, setShowWorkspaceTools] = useState(false);
+  const [importWorkspaceInput, setImportWorkspaceInput] = useState('');
+  const [workspaceMsg, setWorkspaceMsg] = useState<string | null>(null);
+
   const messageRef = useRef<HTMLTextAreaElement | null>(null);
   const qrWrapperRef = useRef<HTMLDivElement | null>(null);
   const analyticsSectionRef = useRef<HTMLDivElement | null>(null);
@@ -101,17 +102,13 @@ export function WhatsAppSection({
   }, [focusAnalytics]);
 
   useEffect(() => {
-    if (!user) {
-      setLinks([]);
-      setRedirectsByCode({});
-      return;
-    }
+    if (!workspaceId) return;
 
     setLoadingLinks(true);
-    const linksPath = `users/${user.uid}/links`;
+    const linksPath = `workspaces/${workspaceId}/links`;
     const linksQuery = query(
-      collection(db, 'users', user.uid, 'links'),
-      where('ownerId', '==', user.uid)
+      collection(db, 'workspaces', workspaceId, 'links'),
+      where('workspaceId', '==', workspaceId)
     );
 
     const unsubLinks = onSnapshot(
@@ -135,31 +132,42 @@ export function WhatsAppSection({
       }
     );
 
-    const redirectsQuery = query(
-      collection(db, 'publicRedirects'),
-      where('ownerId', '==', user.uid)
-    );
+    return () => unsubLinks();
+  }, [workspaceId]);
 
-    const unsubRedirects = onSnapshot(
-      redirectsQuery,
-      (snap) => {
-        const map: Record<string, PublicRedirect> = {};
-        snap.forEach((docSnap) => {
-          const data = docSnap.data() as PublicRedirect;
-          map[data.shortCode] = data;
-        });
-        setRedirectsByCode(map);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'publicRedirects');
-      }
+  const shortenedCodesKey = useMemo(() => {
+    return links
+      .filter((l) => l.isShortened && l.shortCode)
+      .map((l) => l.shortCode)
+      .join(',');
+  }, [links]);
+
+  useEffect(() => {
+    if (!shortenedCodesKey) {
+      setRedirectsByCode({});
+      return;
+    }
+
+    const codes = shortenedCodesKey.split(',').filter(Boolean);
+    const unsubs = codes.map((code) =>
+      onSnapshot(
+        doc(db, 'publicRedirects', code),
+        (docSnap) => {
+          if (docSnap.exists()) {
+            const data = docSnap.data() as PublicRedirect;
+            setRedirectsByCode((prev) => ({ ...prev, [code]: data }));
+          }
+        },
+        (error) => {
+          handleFirestoreError(error, OperationType.GET, `publicRedirects/${code}`);
+        }
+      )
     );
 
     return () => {
-      unsubLinks();
-      unsubRedirects();
+      unsubs.forEach((u) => u());
     };
-  }, [user]);
+  }, [shortenedCodesKey]);
 
   const cleanPhone = sanitizeDigits(phone);
   const cleanCode = sanitizeDigits(countryCode) || '52';
@@ -214,11 +222,6 @@ export function WhatsAppSection({
     setFormError(null);
     setSaveFeedback(null);
 
-    if (!user) {
-      await onSignIn();
-      return;
-    }
-
     if (cleanPhone.length < 4 || cleanPhone.length > 18) {
       setFormError('Ingresa un número de WhatsApp válido (entre 4 y 18 dígitos).');
       return;
@@ -261,10 +264,10 @@ export function WhatsAppSection({
       const safeLabel = (label.trim() || `WhatsApp +${cleanCode} ${cleanPhone}`).slice(0, 100);
       const batch = writeBatch(db);
 
-      const userLinkRef = doc(db, 'users', user.uid, 'links', linkId);
+      const userLinkRef = doc(db, 'workspaces', workspaceId, 'links', linkId);
       batch.set(userLinkRef, {
         id: linkId,
-        ownerId: user.uid,
+        workspaceId,
         label: safeLabel,
         countryCode: cleanCode,
         phone: cleanPhone,
@@ -282,7 +285,7 @@ export function WhatsAppSection({
         const redirectRef = doc(db, 'publicRedirects', finalShortCode);
         batch.set(redirectRef, {
           shortCode: finalShortCode,
-          ownerId: user.uid,
+          workspaceId,
           targetUrl: generatedWaUrl,
           active: true,
           clickCount: 0,
@@ -305,17 +308,16 @@ export function WhatsAppSection({
       );
       window.setTimeout(() => setSaveFeedback(null), 5000);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}/links`);
+      handleFirestoreError(err, OperationType.WRITE, `workspaces/${workspaceId}/links`);
     } finally {
       setSaving(false);
     }
   };
 
   const handleToggleActive = async (link: UserLink) => {
-    if (!user) return;
     const nextActive = !link.active;
     const batch = writeBatch(db);
-    batch.update(doc(db, 'users', user.uid, 'links', link.id), {
+    batch.update(doc(db, 'workspaces', workspaceId, 'links', link.id), {
       active: nextActive,
       updatedAt: serverTimestamp(),
     });
@@ -328,22 +330,35 @@ export function WhatsAppSection({
     try {
       await batch.commit();
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}/links/${link.id}`);
+      handleFirestoreError(err, OperationType.UPDATE, `workspaces/${workspaceId}/links/${link.id}`);
     }
   };
 
   const handleDeleteLink = async (link: UserLink) => {
-    if (!user) return;
     const batch = writeBatch(db);
-    batch.delete(doc(db, 'users', user.uid, 'links', link.id));
+    batch.delete(doc(db, 'workspaces', workspaceId, 'links', link.id));
     if (link.isShortened && link.shortCode) {
       batch.delete(doc(db, 'publicRedirects', link.shortCode));
     }
     try {
       await batch.commit();
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `users/${user.uid}/links/${link.id}`);
+      handleFirestoreError(err, OperationType.DELETE, `workspaces/${workspaceId}/links/${link.id}`);
     }
+  };
+
+  const handleSwitchWorkspace = (e: React.FormEvent) => {
+    e.preventDefault();
+    setWorkspaceMsg(null);
+    const trimmed = importWorkspaceInput.trim();
+    if (!isValidWorkspaceId(trimmed)) {
+      setWorkspaceMsg('La clave debe tener entre 16 y 64 caracteres (letras, números o guiones).');
+      return;
+    }
+    saveWorkspaceId(trimmed);
+    onChangeWorkspaceId(trimmed);
+    setImportWorkspaceInput('');
+    setWorkspaceMsg('Historial sincronizado con la nueva clave.');
   };
 
   const filteredLinks = useMemo(() => {
@@ -369,30 +384,30 @@ export function WhatsAppSection({
   }, [links, redirectsByCode]);
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-8 text-black">
       {/* Builder & Live Preview */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
         {/* Left: Form */}
         <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
-          <div className="space-y-1">
-            <h1 className="text-xl sm:text-2xl font-semibold text-slate-900 tracking-tight">
+          <div className="space-y-1.5">
+            <h1 className="text-2xl sm:text-3xl font-semibold text-black tracking-tight">
               Generador de URL de WhatsApp
             </h1>
-            <p className="text-sm text-slate-600">
-              Crea enlaces directos con mensaje predefinido, acórtalos con seguimiento de clics y guarda tu historial.
+            <p className="text-[18px] text-black leading-relaxed">
+              Crea enlaces directos con mensaje predefinido, acórtalos con seguimiento de clics y guarda tu historial sin iniciar sesión.
             </p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-12 gap-4">
             <div className="sm:col-span-5 space-y-1.5">
-              <label htmlFor="wa-country" className="block text-xs font-medium text-slate-700">
+              <label htmlFor="wa-country" className="block text-[18px] font-medium text-black">
                 Código de país
               </label>
               <select
                 id="wa-country"
                 value={countryCode}
                 onChange={(e) => setCountryCode(e.target.value)}
-                className="w-full h-11 px-3 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                className="w-full h-12 px-3 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
               >
                 {COUNTRY_CODES.map((c) => (
                   <option key={`${c.iso}-${c.code}`} value={c.code}>
@@ -403,7 +418,7 @@ export function WhatsAppSection({
             </div>
 
             <div className="sm:col-span-7 space-y-1.5">
-              <label htmlFor="wa-phone" className="block text-xs font-medium text-slate-700">
+              <label htmlFor="wa-phone" className="block text-[18px] font-medium text-black">
                 Número de WhatsApp
               </label>
               <input
@@ -413,22 +428,22 @@ export function WhatsAppSection({
                 placeholder="Ej. 5512345678"
                 value={phone}
                 onChange={(e) => setPhone(sanitizeDigits(e.target.value).slice(0, 18))}
-                className="w-full h-11 px-3.5 text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                className="w-full h-12 px-3.5 text-[18px] tabular-nums bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
               />
             </div>
           </div>
 
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <label htmlFor="wa-message" className="text-xs font-medium text-slate-700">
+              <label htmlFor="wa-message" className="text-[18px] font-medium text-black">
                 Mensaje predefinido personalizado
               </label>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => applyFormatWrapper('*')}
                   title="Negrita"
-                  className="px-2.5 py-1 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors"
+                  className="px-3 py-1.5 text-sm font-semibold text-black bg-slate-100 hover:bg-slate-200 rounded transition-colors"
                 >
                   Negrita
                 </button>
@@ -436,7 +451,7 @@ export function WhatsAppSection({
                   type="button"
                   onClick={() => applyFormatWrapper('_')}
                   title="Cursiva"
-                  className="px-2.5 py-1 text-xs italic text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors"
+                  className="px-3 py-1.5 text-sm italic text-black bg-slate-100 hover:bg-slate-200 rounded transition-colors"
                 >
                   Cursiva
                 </button>
@@ -444,7 +459,7 @@ export function WhatsAppSection({
                   type="button"
                   onClick={() => applyFormatWrapper('~')}
                   title="Tachado"
-                  className="px-2.5 py-1 text-xs line-through text-slate-700 bg-slate-100 hover:bg-slate-200 rounded transition-colors"
+                  className="px-3 py-1.5 text-sm line-through text-black bg-slate-100 hover:bg-slate-200 rounded transition-colors"
                 >
                   Tachado
                 </button>
@@ -458,7 +473,7 @@ export function WhatsAppSection({
               placeholder="Escribe el mensaje que aparecerá listo para enviar…"
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              className="w-full p-3.5 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600 resize-y"
+              className="w-full p-3.5 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600 resize-y leading-relaxed"
             />
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-1.5">
@@ -467,13 +482,13 @@ export function WhatsAppSection({
                     key={tpl.name}
                     type="button"
                     onClick={() => setMessage(tpl.text)}
-                    className="px-2.5 py-1 text-xs text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors whitespace-nowrap"
+                    className="px-3 py-1.5 text-sm text-black bg-slate-100 hover:bg-slate-200 rounded-md transition-colors whitespace-nowrap"
                   >
                     {tpl.name}
                   </button>
                 ))}
               </div>
-              <span className="text-xs font-mono tabular-nums text-slate-400">
+              <span className="text-sm tabular-nums text-black">
                 {message.length}/2000
               </span>
             </div>
@@ -482,10 +497,10 @@ export function WhatsAppSection({
           <div className="pt-3 border-t border-slate-100 space-y-4">
             <div className="flex items-center justify-between gap-4">
               <div className="space-y-0.5">
-                <span className="text-sm font-medium text-slate-900">
+                <span className="text-[18px] font-medium text-black block">
                   Acortar enlace y rastrear clics
                 </span>
-                <p className="text-xs text-slate-500">
+                <p className="text-[18px] text-black leading-relaxed">
                   Genera una URL corta con conteo en tiempo real por dispositivo y navegador.
                 </p>
               </div>
@@ -494,12 +509,12 @@ export function WhatsAppSection({
                 role="switch"
                 aria-checked={shortenEnabled}
                 onClick={() => setShortenEnabled((v) => !v)}
-                className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 ${
+                className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 ${
                   shortenEnabled ? 'bg-emerald-600' : 'bg-slate-300'
                 }`}
               >
                 <span
-                  className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
+                  className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow-sm transition-transform ${
                     shortenEnabled ? 'translate-x-5' : 'translate-x-0'
                   }`}
                 />
@@ -508,37 +523,37 @@ export function WhatsAppSection({
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-1.5">
-                <label htmlFor="wa-label" className="block text-xs font-medium text-slate-700">
-                  Etiqueta para tu historial (opcional)
+                <label htmlFor="wa-label" className="block text-[18px] font-medium text-black">
+                  Etiqueta (opcional)
                 </label>
                 <input
                   id="wa-label"
                   type="text"
                   maxLength={100}
-                  placeholder="Ej. Campaña Facebook Ads"
+                  placeholder="Ej. Campaña Facebook"
                   value={label}
                   onChange={(e) => setLabel(e.target.value)}
-                  className="w-full h-10 px-3 text-sm bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  className="w-full h-11 px-3 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
                 />
               </div>
 
               {shortenEnabled && (
                 <div className="space-y-1.5">
-                  <label htmlFor="wa-slug" className="block text-xs font-medium text-slate-700">
-                    Alias personalizado (opcional)
+                  <label htmlFor="wa-slug" className="block text-[18px] font-medium text-black">
+                    Alias corto (opcional)
                   </label>
-                  <div className="flex items-center h-10 bg-slate-50 border border-slate-200 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-emerald-600/20 focus-within:border-emerald-600">
-                    <span className="pl-3 pr-1 text-xs font-mono text-slate-400 select-none">/s/</span>
+                  <div className="flex items-center h-11 bg-slate-50 border border-slate-200 rounded-lg overflow-hidden focus-within:ring-2 focus-within:ring-emerald-600/20 focus-within:border-emerald-600">
+                    <span className="pl-3 pr-1 text-[18px] text-black select-none">/s/</span>
                     <input
                       id="wa-slug"
                       type="text"
                       maxLength={32}
-                      placeholder="auto-generado"
+                      placeholder="auto"
                       value={customSlug}
                       onChange={(e) =>
                         setCustomSlug(e.target.value.replace(/[^a-zA-Z0-9_-]/g, ''))
                       }
-                      className="w-full h-full pr-3 text-sm font-mono bg-transparent text-slate-900 placeholder:text-slate-400 focus:outline-none"
+                      className="w-full h-full pr-3 text-[18px] bg-transparent text-black placeholder:text-neutral-500 focus:outline-none"
                     />
                   </div>
                 </div>
@@ -547,57 +562,45 @@ export function WhatsAppSection({
           </div>
 
           {formError && (
-            <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
+            <div className="p-3.5 rounded-lg bg-red-50 border border-red-200 text-[18px] text-red-700">
               {formError}
             </div>
           )}
 
           {saveFeedback && (
-            <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex items-center justify-between gap-2">
+            <div className="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 text-[18px] text-black flex items-center justify-between gap-2">
               <span className="truncate">{saveFeedback}</span>
-              <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+              <Check className="w-5 h-5 text-emerald-600 shrink-0" />
             </div>
           )}
 
           <div className="flex flex-wrap items-center gap-3 pt-1">
-            {user ? (
-              <button
-                type="button"
-                disabled={saving}
-                onClick={handleSaveLink}
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[44px] text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
-              >
-                {saving ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : shortenEnabled ? (
-                  <Scissors className="w-4 h-4" />
-                ) : (
-                  <Link2 className="w-4 h-4" />
-                )}
-                {shortenEnabled ? 'Generar y acortar enlace' : 'Guardar en historial'}
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={authLoading}
-                onClick={onSignIn}
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[44px] text-sm font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors whitespace-nowrap"
-              >
-                <LogIn className="w-4 h-4" />
-                Iniciar sesión para acortar y guardar
-              </button>
-            )}
+            <button
+              type="button"
+              disabled={saving}
+              onClick={handleSaveLink}
+              className="inline-flex items-center justify-center gap-2 px-5 py-3 min-h-[48px] text-[18px] font-medium text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {saving ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : shortenEnabled ? (
+                <Scissors className="w-5 h-5" />
+              ) : (
+                <Link2 className="w-5 h-5" />
+              )}
+              {shortenEnabled ? 'Generar y acortar enlace' : 'Guardar en historial'}
+            </button>
 
             <button
               type="button"
               disabled={!generatedWaUrl}
               onClick={() => handleCopy('preview-wa', generatedWaUrl)}
-              className="inline-flex items-center justify-center gap-2 px-4 py-2.5 min-h-[44px] text-sm font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
+              className="inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[48px] text-[18px] font-medium text-black bg-slate-100 hover:bg-slate-200 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
             >
               {copiedKey === 'preview-wa' ? (
-                <Check className="w-4 h-4 text-emerald-600" />
+                <Check className="w-5 h-5 text-emerald-600" />
               ) : (
-                <Copy className="w-4 h-4" />
+                <Copy className="w-5 h-5" />
               )}
               {copiedKey === 'preview-wa' ? 'URL copiada' : 'Copiar URL directa'}
             </button>
@@ -606,28 +609,27 @@ export function WhatsAppSection({
 
         {/* Right: Live WhatsApp Preview & QR */}
         <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-5 sm:p-6 space-y-5">
-          <div className="flex items-center justify-between">
-            <h2 className="text-base font-semibold text-slate-900">Vista previa en tiempo real</h2>
-            <span className="text-xs font-mono text-slate-500">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xl font-semibold text-black">Vista previa en tiempo real</h2>
+            <span className="text-[18px] tabular-nums text-black">
               +{cleanCode} {cleanPhone || '••••••••••'}
             </span>
           </div>
 
-          {/* Chat Simulation Surface */}
           <div className="rounded-xl overflow-hidden border border-slate-200">
             <div className="bg-emerald-800 text-white px-4 py-3 flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-emerald-700 flex items-center justify-center text-xs font-semibold">
+              <div className="w-9 h-9 rounded-full bg-emerald-700 flex items-center justify-center text-sm font-semibold shrink-0">
                 WA
               </div>
               <div className="min-w-0">
-                <p className="text-sm font-medium truncate">
+                <p className="text-[18px] font-medium text-white truncate">
                   {label.trim() || `+${cleanCode} ${cleanPhone || 'Tu número'}`}
                 </p>
-                <p className="text-[11px] text-emerald-200">Enlace directo de chat</p>
+                <p className="text-sm text-emerald-100">Enlace directo de chat</p>
               </div>
             </div>
-            <div className="bg-slate-100 p-4 min-h-[120px] flex flex-col justify-end">
-              <div className="ml-auto max-w-[88%] bg-emerald-100 text-slate-900 rounded-xl rounded-tr-sm px-3.5 py-2.5 text-sm leading-relaxed break-words shadow-xs">
+            <div className="bg-slate-100 p-4 min-h-[130px] flex flex-col justify-end">
+              <div className="ml-auto max-w-[90%] bg-emerald-100 text-black rounded-xl rounded-tr-sm px-4 py-3 text-[18px] leading-relaxed break-words shadow-xs">
                 {message.trim() ? (
                   <p className="whitespace-pre-wrap">
                     {formattedSegments.map((seg, idx) => {
@@ -638,25 +640,24 @@ export function WhatsAppSection({
                     })}
                   </p>
                 ) : (
-                  <span className="text-slate-400 italic">Sin mensaje predefinido</span>
+                  <span className="text-black italic">Sin mensaje predefinido</span>
                 )}
-                <div className="text-[10px] text-emerald-800/70 text-right mt-1 font-mono tabular-nums">
+                <div className="text-xs text-black/70 text-right mt-1 tabular-nums">
                   Ahora
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Generated URL & QR */}
           <div className="space-y-3 pt-2 border-t border-slate-100">
-            <div className="space-y-1">
-              <p className="text-xs font-medium text-slate-600">URL generada</p>
-              <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg font-mono text-xs text-slate-700 break-all">
+            <div className="space-y-1.5">
+              <p className="text-[18px] font-medium text-black">URL generada</p>
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-[18px] text-black break-all">
                 {generatedWaUrl || 'Ingresa un número para ver tu enlace https://wa.me/...'}
               </div>
               {shortenEnabled && (
-                <p className="text-xs text-slate-500 font-mono truncate">
-                  Enlace corto al guardar: {window.location.origin}/s/{previewSlug}
+                <p className="text-[18px] text-black truncate">
+                  Corto: {window.location.origin}/s/{previewSlug}
                 </p>
               )}
             </div>
@@ -667,28 +668,28 @@ export function WhatsAppSection({
                   ref={qrWrapperRef}
                   className="p-2.5 bg-white border border-slate-200 rounded-lg shrink-0"
                 >
-                  <QRCodeCanvas value={generatedWaUrl} size={108} level="M" />
+                  <QRCodeCanvas value={generatedWaUrl} size={112} level="M" />
                 </div>
-                <div className="flex-1 w-full space-y-2">
-                  <p className="text-xs text-slate-600">
-                    Escanea el código QR desde cualquier móvil o descárgalo para flyers y tarjetas.
+                <div className="flex-1 w-full space-y-2.5">
+                  <p className="text-[18px] text-black leading-relaxed">
+                    Escanea el código QR o descárgalo en imagen PNG.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
                       onClick={handleDownloadQr}
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <QrCode className="w-3.5 h-3.5" />
+                      <QrCode className="w-4 h-4" />
                       Descargar QR
                     </button>
                     <a
                       href={generatedWaUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-emerald-50 hover:bg-emerald-100 text-black rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <ExternalLink className="w-3.5 h-3.5" />
+                      <ExternalLink className="w-4 h-4" />
                       Probar WhatsApp
                     </a>
                   </div>
@@ -699,33 +700,31 @@ export function WhatsAppSection({
         </div>
       </section>
 
-      {/* User Link History */}
+      {/* Link History */}
       <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
-          <div className="space-y-0.5">
-            <div className="flex items-center gap-3">
-              <h2 className="text-base font-semibold text-slate-900">Historial de enlaces creados</h2>
-              {user && (
-                <span className="text-xs font-mono tabular-nums text-slate-500">
+        <div className="px-5 py-4 border-b border-slate-200 space-y-3">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-3">
+                <h2 className="text-xl font-semibold text-black">Historial de enlaces creados</h2>
+                <span className="text-[18px] tabular-nums text-black">
                   {links.length} enlaces · {totalClicksAll} clics totales
                 </span>
-              )}
+              </div>
+              <p className="text-[18px] text-black">
+                Tu historial se guarda automáticamente en este navegador y en la nube sin crear cuenta.
+              </p>
             </div>
-            <p className="text-xs text-slate-500">
-              Cada usuario mantiene su historial privado sincronizado en la nube.
-            </p>
-          </div>
 
-          {user && (
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+            <div className="flex flex-wrap items-center gap-2.5">
               <div className="relative">
-                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <Search className="w-4 h-4 text-black absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="search"
-                  placeholder="Buscar por nombre o número…"
+                  placeholder="Buscar enlace…"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  className="w-full sm:w-56 h-9 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
+                  className="w-full sm:w-56 h-11 pl-9 pr-3 text-[18px] bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600"
                 />
               </div>
 
@@ -741,55 +740,75 @@ export function WhatsAppSection({
                     key={tab.key}
                     type="button"
                     onClick={() => setFilterMode(tab.key)}
-                    className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
+                    className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors whitespace-nowrap ${
                       filterMode === tab.key
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
+                        ? 'bg-white text-black shadow-xs'
+                        : 'text-black hover:bg-slate-200/60'
                     }`}
                   >
                     {tab.label}
                   </button>
                 ))}
               </div>
+
+              <button
+                type="button"
+                onClick={() => setShowWorkspaceTools((v) => !v)}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
+              >
+                <KeyRound className="w-4 h-4" />
+                Clave de historial
+              </button>
+            </div>
+          </div>
+
+          {showWorkspaceTools && (
+            <div className="pt-3 border-t border-slate-100 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-[18px] text-black">
+                <span>Tu clave actual:</span>
+                <code className="px-2.5 py-1 bg-slate-100 rounded text-sm text-black">{workspaceId}</code>
+                <button
+                  type="button"
+                  onClick={() => handleCopy('ws-key', workspaceId)}
+                  className="px-3 py-1 text-sm font-medium bg-slate-100 hover:bg-slate-200 text-black rounded transition-colors"
+                >
+                  {copiedKey === 'ws-key' ? 'Copiada' : 'Copiar clave'}
+                </button>
+              </div>
+              <form onSubmit={handleSwitchWorkspace} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Pegar clave de otro dispositivo…"
+                  value={importWorkspaceInput}
+                  onChange={(e) => setImportWorkspaceInput(e.target.value)}
+                  className="h-10 px-3 text-sm bg-slate-50 border border-slate-200 rounded-lg text-black placeholder:text-neutral-500"
+                />
+                <button
+                  type="submit"
+                  className="px-3.5 h-10 text-sm font-medium bg-black text-white rounded-lg hover:bg-neutral-800 transition-colors whitespace-nowrap"
+                >
+                  Cargar historial
+                </button>
+              </form>
+              {workspaceMsg && <p className="text-sm text-black">{workspaceMsg}</p>}
             </div>
           )}
         </div>
 
-        {!user ? (
-          <div className="p-8 text-center space-y-3">
-            <MessageSquare className="w-7 h-7 text-slate-400 mx-auto" />
-            <div className="space-y-1">
-              <h3 className="text-sm font-semibold text-slate-900">
-                Inicia sesión para guardar y consultar tu historial
-              </h3>
-              <p className="text-xs text-slate-500 max-w-md mx-auto">
-                Accede con tu cuenta de Google para acortar enlaces de WhatsApp, consultar estadísticas de clics en
-                tiempo real y administrar tus enlaces desde cualquier dispositivo.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={onSignIn}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg transition-colors"
-            >
-              <LogIn className="w-3.5 h-3.5" />
-              Continuar con Google
-            </button>
-          </div>
-        ) : loadingLinks ? (
+        {loadingLinks ? (
           <div className="p-6 space-y-3">
             {[1, 2, 3].map((row) => (
-              <div key={row} className="h-11 bg-slate-100 rounded-lg animate-pulse" />
+              <div key={row} className="h-12 bg-slate-100 rounded-lg animate-pulse" />
             ))}
           </div>
         ) : filteredLinks.length === 0 ? (
-          <div className="p-8 text-center space-y-1.5">
-            <p className="text-sm font-medium text-slate-900">
+          <div className="p-8 text-center space-y-2">
+            <p className="text-[18px] font-semibold text-black">
               {links.length === 0
                 ? 'Todavía no has guardado ningún enlace'
                 : 'No hay enlaces que coincidan con tu búsqueda'}
             </p>
-            <p className="text-xs text-slate-500">
+            <p className="text-[18px] text-black">
               Usa el generador de arriba para crear tu primer enlace de WhatsApp personalizado.
             </p>
           </div>
@@ -805,26 +824,26 @@ export function WhatsAppSection({
               return (
                 <div
                   key={link.id}
-                  className="px-5 py-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3 hover:bg-slate-50/70 transition-colors"
+                  className="px-5 py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3 hover:bg-slate-50/70 transition-colors"
                 >
                   <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-sm font-semibold text-slate-900 truncate">
+                    <div className="flex flex-wrap items-center gap-2 text-[18px]">
+                      <span className="font-semibold text-black truncate">
                         {link.label}
                       </span>
-                      <span className="text-xs text-slate-400" aria-hidden="true">
+                      <span className="text-black" aria-hidden="true">
                         ·
                       </span>
-                      <span className="text-xs font-mono tabular-nums text-slate-600">
+                      <span className="tabular-nums text-black">
                         +{link.countryCode} {link.phone}
                       </span>
                       {link.isShortened && (
                         <>
-                          <span className="text-xs text-slate-400" aria-hidden="true">
+                          <span className="text-black" aria-hidden="true">
                             ·
                           </span>
                           <span
-                            className={`text-xs font-medium ${
+                            className={`font-medium ${
                               link.active ? 'text-emerald-700' : 'text-amber-700'
                             }`}
                           >
@@ -833,9 +852,9 @@ export function WhatsAppSection({
                         </>
                       )}
                     </div>
-                    <p className="text-xs font-mono text-emerald-700 truncate">{bestUrl}</p>
+                    <p className="text-[18px] text-emerald-700 truncate">{bestUrl}</p>
                     {link.message && (
-                      <p className="text-xs text-slate-500 truncate max-w-2xl">{link.message}</p>
+                      <p className="text-[18px] text-black truncate max-w-2xl">{link.message}</p>
                     )}
                   </div>
 
@@ -850,9 +869,9 @@ export function WhatsAppSection({
                             block: 'start',
                           });
                         }}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg transition-colors tabular-nums whitespace-nowrap"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-emerald-50 hover:bg-emerald-100 text-black rounded-lg transition-colors tabular-nums whitespace-nowrap"
                       >
-                        <BarChart3 className="w-3.5 h-3.5" />
+                        <BarChart3 className="w-4 h-4 text-emerald-700" />
                         {clickCount} clics
                       </button>
                     )}
@@ -860,12 +879,12 @@ export function WhatsAppSection({
                     <button
                       type="button"
                       onClick={() => handleCopy(link.id, bestUrl)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors whitespace-nowrap"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
                     >
                       {copiedKey === link.id ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-600" />
+                        <Check className="w-4 h-4 text-emerald-600" />
                       ) : (
-                        <Copy className="w-3.5 h-3.5" />
+                        <Copy className="w-4 h-4" />
                       )}
                       {copiedKey === link.id ? 'Copiado' : 'Copiar'}
                     </button>
@@ -875,9 +894,9 @@ export function WhatsAppSection({
                       target="_blank"
                       rel="noopener noreferrer"
                       title="Abrir en WhatsApp"
-                      className="inline-flex items-center justify-center p-2 text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+                      className="inline-flex items-center justify-center p-2.5 text-black bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
                     >
-                      <ExternalLink className="w-3.5 h-3.5" />
+                      <ExternalLink className="w-4 h-4" />
                     </a>
 
                     {link.isShortened && (
@@ -885,9 +904,9 @@ export function WhatsAppSection({
                         type="button"
                         onClick={() => handleToggleActive(link)}
                         title={link.active ? 'Pausar enlace' : 'Reactivar enlace'}
-                        className="inline-flex items-center justify-center p-2 text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
+                        className="inline-flex items-center justify-center p-2.5 text-black bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors"
                       >
-                        {link.active ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                        {link.active ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
                       </button>
                     )}
 
@@ -895,9 +914,9 @@ export function WhatsAppSection({
                       type="button"
                       onClick={() => handleDeleteLink(link)}
                       title="Eliminar enlace"
-                      className="inline-flex items-center justify-center p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                      className="inline-flex items-center justify-center p-2.5 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
+                      <Trash2 className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
@@ -908,17 +927,15 @@ export function WhatsAppSection({
       </section>
 
       {/* Click Analytics Panel */}
-      {user && (
-        <section ref={analyticsSectionRef}>
-          <ClickAnalyticsPanel
-            userId={user.uid}
-            links={links}
-            redirectsByCode={redirectsByCode}
-            selectedLinkId={selectedAnalyticsLinkId}
-            onSelectLink={(id) => setSelectedAnalyticsLinkId(id)}
-          />
-        </section>
-      )}
+      <section ref={analyticsSectionRef}>
+        <ClickAnalyticsPanel
+          workspaceId={workspaceId}
+          links={links}
+          redirectsByCode={redirectsByCode}
+          selectedLinkId={selectedAnalyticsLinkId}
+          onSelectLink={(id) => setSelectedAnalyticsLinkId(id)}
+        />
+      </section>
     </div>
   );
 }

@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { collection, limit, onSnapshot, query, where } from 'firebase/firestore';
-import { ArrowUpRight, BarChart3, Copy, Check, Monitor, Smartphone, Tablet } from 'lucide-react';
+import { ArrowUpRight, BarChart3, Check, Copy, Monitor, Smartphone, Tablet } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import type { ClickEvent, PublicRedirect, UserLink } from '../types/app';
 
 interface ClickAnalyticsPanelProps {
-  userId: string;
+  workspaceId: string;
   links: UserLink[];
   redirectsByCode: Record<string, PublicRedirect>;
   selectedLinkId: string | null;
@@ -13,7 +13,7 @@ interface ClickAnalyticsPanelProps {
 }
 
 export function ClickAnalyticsPanel({
-  userId,
+  workspaceId,
   links,
   redirectsByCode,
   selectedLinkId,
@@ -32,21 +32,21 @@ export function ClickAnalyticsPanel({
     return shortenedLinks[0] || null;
   }, [selectedLinkId, shortenedLinks]);
 
-  const [clicks, setClicks] = useState<ClickEvent[]>([]);
+  const [allClicks, setAllClicks] = useState<ClickEvent[]>([]);
   const [loadingClicks, setLoadingClicks] = useState(false);
   const [copiedUrl, setCopiedUrl] = useState(false);
 
   useEffect(() => {
-    if (!activeLink?.shortCode) {
-      setClicks([]);
+    if (!workspaceId) {
+      setAllClicks([]);
       return;
     }
     setLoadingClicks(true);
-    const clicksPath = `publicRedirects/${activeLink.shortCode}/clicks`;
+    const clicksPath = `workspaces/${workspaceId}/clicks`;
     const q = query(
-      collection(db, 'publicRedirects', activeLink.shortCode, 'clicks'),
-      where('ownerId', '==', userId),
-      limit(500)
+      collection(db, 'workspaces', workspaceId, 'clicks'),
+      where('workspaceId', '==', workspaceId),
+      limit(1000)
     );
 
     const unsub = onSnapshot(
@@ -61,7 +61,7 @@ export function ClickAnalyticsPanel({
           const tb = b.clickedAt?.toMillis?.() ?? 0;
           return tb - ta;
         });
-        setClicks(items);
+        setAllClicks(items);
         setLoadingClicks(false);
       },
       (error) => {
@@ -71,7 +71,12 @@ export function ClickAnalyticsPanel({
     );
 
     return () => unsub();
-  }, [activeLink?.shortCode, userId]);
+  }, [workspaceId]);
+
+  const clicks = useMemo(() => {
+    if (!activeLink?.shortCode) return [];
+    return allClicks.filter((c) => c.shortCode === activeLink.shortCode);
+  }, [allClicks, activeLink?.shortCode]);
 
   const stats = useMemo(() => {
     const now = new Date();
@@ -84,8 +89,6 @@ export function ClickAnalyticsPanel({
       tablet: 0,
     };
     const browsers: Record<string, number> = {};
-    const osMap: Record<string, number> = {};
-    const referrers: Record<string, number> = {};
 
     const last7Days: { key: string; label: string; count: number }[] = [];
     for (let i = 6; i >= 0; i--) {
@@ -100,8 +103,6 @@ export function ClickAnalyticsPanel({
     for (const c of clicks) {
       devices[c.deviceType] = (devices[c.deviceType] || 0) + 1;
       browsers[c.browser] = (browsers[c.browser] || 0) + 1;
-      osMap[c.os] = (osMap[c.os] || 0) + 1;
-      referrers[c.referrer] = (referrers[c.referrer] || 0) + 1;
 
       const dt = c.clickedAt?.toDate?.();
       if (dt) {
@@ -120,19 +121,16 @@ export function ClickAnalyticsPanel({
     const mobilePct = total > 0 ? Math.round((devices.mobile / total) * 100) : 0;
     const maxDaily = Math.max(1, ...last7Days.map((d) => d.count));
 
-    const sortTop = (map: Record<string, number>) =>
-      Object.entries(map)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5);
+    const topBrowsers = Object.entries(browsers)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
 
     return {
       displayTotal,
       todayClicks,
       mobilePct,
       devices,
-      topBrowsers: sortTop(browsers),
-      topOs: sortTop(osMap),
-      topReferrers: sortTop(referrers),
+      topBrowsers,
       last7Days,
       maxDaily,
       lastClickDate: clicks[0]?.clickedAt?.toDate?.() || null,
@@ -142,9 +140,11 @@ export function ClickAnalyticsPanel({
   if (shortenedLinks.length === 0) {
     return (
       <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-2">
-        <BarChart3 className="w-7 h-7 text-slate-400 mx-auto" />
-        <h3 className="text-base font-semibold text-slate-900">Aún no hay enlaces acortados con estadísticas</h3>
-        <p className="text-sm text-slate-500 max-w-md mx-auto">
+        <BarChart3 className="w-7 h-7 text-black mx-auto" />
+        <h3 className="text-xl font-semibold text-black">
+          Aún no hay enlaces acortados con estadísticas
+        </h3>
+        <p className="text-[18px] text-black max-w-2xl mx-auto leading-relaxed">
           Activa la opción &ldquo;Acortar enlace y rastrear clics&rdquo; al crear tu URL de WhatsApp para visualizar
           estadísticas en tiempo real por dispositivo, navegador y día.
         </p>
@@ -162,10 +162,10 @@ export function ClickAnalyticsPanel({
   return (
     <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
       <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-        <div className="space-y-0.5">
-          <h3 className="text-base font-semibold text-slate-900">Estadísticas de clics en tiempo real</h3>
-          <p className="text-xs text-slate-500">
-            Selecciona cualquiera de tus enlaces acortados para inspeccionar su tráfico
+        <div className="space-y-1">
+          <h3 className="text-xl font-semibold text-black">Estadísticas de clics en tiempo real</h3>
+          <p className="text-[18px] text-black">
+            Selecciona cualquiera de tus enlaces acortados para inspeccionar su tráfico.
           </p>
         </div>
 
@@ -174,7 +174,7 @@ export function ClickAnalyticsPanel({
             aria-label="Seleccionar enlace acortado"
             value={activeLink?.id || ''}
             onChange={(e) => onSelectLink(e.target.value)}
-            className="text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600 max-w-[260px]"
+            className="text-[18px] bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-black focus:outline-none focus:ring-2 focus:ring-emerald-600/20 focus:border-emerald-600 max-w-[300px]"
           >
             {shortenedLinks.map((link) => {
               const count = redirectsByCode[link.shortCode]?.clickCount ?? 0;
@@ -192,29 +192,29 @@ export function ClickAnalyticsPanel({
         <div className="p-5 space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
             <div className="min-w-0 space-y-1">
-              <div className="flex items-center gap-2 text-xs text-slate-500">
+              <div className="flex items-center gap-2 text-[18px] text-black">
                 <span>+{activeLink.countryCode} {activeLink.phone}</span>
                 <span aria-hidden="true">·</span>
                 <span>{activeLink.active ? 'Enlace activo' : 'Enlace pausado'}</span>
               </div>
-              <p className="font-mono text-sm text-emerald-700 truncate">{activeLink.shortUrl}</p>
+              <p className="text-[18px] font-medium text-emerald-700 truncate">{activeLink.shortUrl}</p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={handleCopyShort}
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium bg-slate-100 hover:bg-slate-200 text-black rounded-lg transition-colors whitespace-nowrap"
               >
-                {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedUrl ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
                 {copiedUrl ? 'Copiado' : 'Copiar corto'}
               </button>
               <a
                 href={`/s/${activeLink.shortCode}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-[18px] font-medium bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors whitespace-nowrap"
               >
-                <ArrowUpRight className="w-3.5 h-3.5" />
+                <ArrowUpRight className="w-4 h-4" />
                 Probar
               </a>
             </div>
@@ -222,20 +222,20 @@ export function ClickAnalyticsPanel({
 
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="py-2">
-              <p className="text-xs text-slate-500">Clics totales</p>
-              <p className="text-2xl font-semibold text-slate-900 tabular-nums mt-1">{stats.displayTotal}</p>
+              <p className="text-[18px] text-black">Clics totales</p>
+              <p className="text-3xl font-semibold text-black tabular-nums mt-1">{stats.displayTotal}</p>
             </div>
             <div className="py-2 border-l border-slate-100 pl-4">
-              <p className="text-xs text-slate-500">Clics hoy</p>
-              <p className="text-2xl font-semibold text-slate-900 tabular-nums mt-1">{stats.todayClicks}</p>
+              <p className="text-[18px] text-black">Clics hoy</p>
+              <p className="text-3xl font-semibold text-black tabular-nums mt-1">{stats.todayClicks}</p>
             </div>
             <div className="py-2 lg:border-l border-slate-100 lg:pl-4">
-              <p className="text-xs text-slate-500">Tráfico móvil</p>
-              <p className="text-2xl font-semibold text-slate-900 tabular-nums mt-1">{stats.mobilePct}%</p>
+              <p className="text-[18px] text-black">Tráfico móvil</p>
+              <p className="text-3xl font-semibold text-black tabular-nums mt-1">{stats.mobilePct}%</p>
             </div>
             <div className="py-2 border-l border-slate-100 pl-4">
-              <p className="text-xs text-slate-500">Último clic</p>
-              <p className="text-sm font-medium text-slate-900 tabular-nums mt-2">
+              <p className="text-[18px] text-black">Último clic</p>
+              <p className="text-[18px] font-medium text-black tabular-nums mt-2">
                 {stats.lastClickDate
                   ? stats.lastClickDate.toLocaleString('es-ES', {
                       day: '2-digit',
@@ -251,22 +251,22 @@ export function ClickAnalyticsPanel({
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-2 border-t border-slate-100">
             <div className="lg:col-span-7 space-y-3">
               <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-slate-900">Actividad de los últimos 7 días</h4>
-                {loadingClicks && <span className="text-xs text-slate-400">Actualizando…</span>}
+                <h4 className="text-[18px] font-semibold text-black">Actividad de los últimos 7 días</h4>
+                {loadingClicks && <span className="text-[18px] text-black">Actualizando…</span>}
               </div>
-              <div className="grid grid-cols-7 gap-2 items-end h-36 pt-4">
+              <div className="grid grid-cols-7 gap-2 items-end h-40 pt-4">
                 {stats.last7Days.map((day) => {
                   const pct = Math.max(4, Math.round((day.count / stats.maxDaily) * 100));
                   return (
                     <div key={day.key} className="flex flex-col items-center gap-1.5 h-full justify-end">
-                      <span className="text-xs font-mono tabular-nums text-slate-600">{day.count}</span>
+                      <span className="text-sm tabular-nums text-black">{day.count}</span>
                       <div className="w-full max-w-[36px] bg-slate-100 rounded-md h-24 flex items-end overflow-hidden">
                         <div
                           className="w-full bg-emerald-600 rounded-md transition-all duration-200"
                           style={{ height: day.count === 0 ? '4px' : `${pct}%` }}
                         />
                       </div>
-                      <span className="text-[11px] text-slate-500 capitalize truncate max-w-full">
+                      <span className="text-xs text-black capitalize truncate max-w-full">
                         {day.label}
                       </span>
                     </div>
@@ -276,38 +276,40 @@ export function ClickAnalyticsPanel({
             </div>
 
             <div className="lg:col-span-5 space-y-4">
-              <h4 className="text-sm font-semibold text-slate-900">Distribución por dispositivo y navegador</h4>
-              <div className="space-y-2.5 text-sm">
-                <div className="flex items-center justify-between text-slate-700">
+              <h4 className="text-[18px] font-semibold text-black">
+                Dispositivos y navegadores
+              </h4>
+              <div className="space-y-2.5 text-[18px]">
+                <div className="flex items-center justify-between text-black">
                   <span className="inline-flex items-center gap-2">
-                    <Smartphone className="w-4 h-4 text-slate-400" />
+                    <Smartphone className="w-5 h-5 text-black" />
                     Móvil
                   </span>
-                  <span className="font-mono tabular-nums font-medium">{stats.devices.mobile}</span>
+                  <span className="tabular-nums font-medium">{stats.devices.mobile}</span>
                 </div>
-                <div className="flex items-center justify-between text-slate-700">
+                <div className="flex items-center justify-between text-black">
                   <span className="inline-flex items-center gap-2">
-                    <Monitor className="w-4 h-4 text-slate-400" />
+                    <Monitor className="w-5 h-5 text-black" />
                     Escritorio
                   </span>
-                  <span className="font-mono tabular-nums font-medium">{stats.devices.desktop}</span>
+                  <span className="tabular-nums font-medium">{stats.devices.desktop}</span>
                 </div>
-                <div className="flex items-center justify-between text-slate-700">
+                <div className="flex items-center justify-between text-black">
                   <span className="inline-flex items-center gap-2">
-                    <Tablet className="w-4 h-4 text-slate-400" />
+                    <Tablet className="w-5 h-5 text-black" />
                     Tablet
                   </span>
-                  <span className="font-mono tabular-nums font-medium">{stats.devices.tablet}</span>
+                  <span className="tabular-nums font-medium">{stats.devices.tablet}</span>
                 </div>
               </div>
 
               {stats.topBrowsers.length > 0 && (
                 <div className="pt-3 border-t border-slate-100 space-y-2">
-                  <p className="text-xs font-medium text-slate-500">Navegadores principales</p>
+                  <p className="text-[18px] font-medium text-black">Navegadores principales</p>
                   {stats.topBrowsers.map(([browser, count]) => (
-                    <div key={browser} className="flex items-center justify-between text-xs text-slate-700">
+                    <div key={browser} className="flex items-center justify-between text-[18px] text-black">
                       <span className="truncate pr-2">{browser}</span>
-                      <span className="font-mono tabular-nums text-slate-900 font-medium">{count}</span>
+                      <span className="tabular-nums text-black font-medium">{count}</span>
                     </div>
                   ))}
                 </div>
@@ -317,22 +319,22 @@ export function ClickAnalyticsPanel({
 
           {clicks.length > 0 && (
             <div className="pt-4 border-t border-slate-100 space-y-3">
-              <h4 className="text-sm font-semibold text-slate-900">Últimos clics registrados</h4>
+              <h4 className="text-[18px] font-semibold text-black">Últimos clics registrados</h4>
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
+                <table className="w-full text-left text-[18px]">
                   <thead>
-                    <tr className="border-b border-slate-200 text-slate-500">
-                      <th className="py-2 pr-4 font-medium">Fecha y hora</th>
-                      <th className="py-2 pr-4 font-medium">Dispositivo</th>
-                      <th className="py-2 pr-4 font-medium">Sistema</th>
-                      <th className="py-2 pr-4 font-medium">Navegador</th>
-                      <th className="py-2 font-medium text-right">Origen</th>
+                    <tr className="border-b border-slate-200 text-black">
+                      <th className="py-2 pr-4 font-semibold">Fecha y hora</th>
+                      <th className="py-2 pr-4 font-semibold">Dispositivo</th>
+                      <th className="py-2 pr-4 font-semibold">Sistema</th>
+                      <th className="py-2 pr-4 font-semibold">Navegador</th>
+                      <th className="py-2 font-semibold text-right">Origen</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {clicks.slice(0, 8).map((c) => (
-                      <tr key={c.clickId} className="text-slate-700">
-                        <td className="py-2 pr-4 font-mono tabular-nums whitespace-nowrap">
+                      <tr key={c.clickId} className="text-black">
+                        <td className="py-2 pr-4 tabular-nums whitespace-nowrap">
                           {c.clickedAt?.toDate?.()
                             ? c.clickedAt.toDate().toLocaleString('es-ES', {
                                 day: '2-digit',
@@ -351,7 +353,7 @@ export function ClickAnalyticsPanel({
                         </td>
                         <td className="py-2 pr-4">{c.os}</td>
                         <td className="py-2 pr-4">{c.browser}</td>
-                        <td className="py-2 text-right text-slate-500">{c.referrer}</td>
+                        <td className="py-2 text-right text-black">{c.referrer}</td>
                       </tr>
                     ))}
                   </tbody>

@@ -27,6 +27,37 @@ export const COUNTRY_CODES: CountryCodeOption[] = [
   { code: '55', country: 'Brasil', iso: 'BR' },
 ];
 
+const WORKSPACE_STORAGE_KEY = 'enlaceflow_workspace_id';
+
+export function isValidWorkspaceId(id: string): boolean {
+  return /^[a-zA-Z0-9_-]{16,64}$/.test(id);
+}
+
+export function getOrCreateWorkspaceId(): string {
+  try {
+    const existing = window.localStorage.getItem(WORKSPACE_STORAGE_KEY);
+    if (existing && isValidWorkspaceId(existing)) {
+      return existing;
+    }
+    const created = `ws_${generateShortCode(22)}`;
+    window.localStorage.setItem(WORKSPACE_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return `ws_${generateShortCode(22)}`;
+  }
+}
+
+export function saveWorkspaceId(id: string): boolean {
+  const trimmed = id.trim();
+  if (!isValidWorkspaceId(trimmed)) return false;
+  try {
+    window.localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
+  } catch {
+    // ignore storage quota errors
+  }
+  return true;
+}
+
 export function sanitizeDigits(value: string): string {
   return value.replace(/\D/g, '');
 }

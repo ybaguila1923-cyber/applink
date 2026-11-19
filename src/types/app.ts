@@ -1,17 +1,8 @@
 import type { Timestamp } from 'firebase/firestore';
 
-export interface UserProfile {
-  uid: string;
-  email: string;
-  displayName: string;
-  photoURL: string;
-  createdAt: Timestamp;
-  updatedAt: Timestamp;
-}
-
 export interface UserLink {
   id: string;
-  ownerId: string;
+  workspaceId: string;
   label: string;
   countryCode: string;
   phone: string;
@@ -27,7 +18,7 @@ export interface UserLink {
 
 export interface PublicRedirect {
   shortCode: string;
-  ownerId: string;
+  workspaceId: string;
   targetUrl: string;
   active: boolean;
   clickCount: number;
@@ -38,7 +29,7 @@ export interface PublicRedirect {
 export interface ClickEvent {
   clickId: string;
   shortCode: string;
-  ownerId: string;
+  workspaceId: string;
   deviceType: 'mobile' | 'desktop' | 'tablet';
   browser: string;
   os: string;
@@ -53,7 +44,10 @@ export interface MediaOption {
   label: string;
   format: 'mp4' | 'mp3' | 'jpg' | 'm4a' | 'webm';
   quality: string;
+  resolution?: string;
+  dimensions?: string;
   url: string;
+  audioSourceUrl?: string;
   filename: string;
   sizeBytes?: number;
   noWatermark?: boolean;
