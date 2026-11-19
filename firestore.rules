@@ -1,0 +1,177 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidShortCode(code) {
+      return code is string && code.size() >= 3 && code.size() <= 32 && code.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() <= 120
+        && data.photoURL is string && data.photoURL.size() <= 512
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserLink(data, userId, linkId) {
+      return data.keys().hasAll([
+          'id', 'ownerId', 'label', 'countryCode', 'phone', 'message',
+          'targetUrl', 'shortCode', 'shortUrl', 'isShortened', 'active',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerId', 'label', 'countryCode', 'phone', 'message',
+          'targetUrl', 'shortCode', 'shortUrl', 'isShortened', 'active',
+          'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == linkId && data.id.size() >= 3 && data.id.size() <= 64
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.label is string && data.label.size() >= 1 && data.label.size() <= 100
+        && data.countryCode is string && data.countryCode.size() >= 1 && data.countryCode.size() <= 6 && data.countryCode.matches('^[0-9]{1,5}$')
+        && data.phone is string && data.phone.size() >= 4 && data.phone.size() <= 20 && data.phone.matches('^[0-9]{4,18}$')
+        && data.message is string && data.message.size() <= 2000
+        && data.targetUrl is string && data.targetUrl.size() >= 12 && data.targetUrl.size() <= 4096
+        && data.targetUrl.matches('^https://(wa\\.me|api\\.whatsapp\\.com)/.*')
+        && data.shortCode is string && data.shortCode.size() <= 32
+        && data.shortUrl is string && data.shortUrl.size() <= 512
+        && data.isShortened is bool
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPublicRedirect(data, shortCode) {
+      return data.keys().hasAll(['shortCode', 'ownerId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['shortCode', 'ownerId', 'targetUrl', 'active', 'clickCount', 'createdAt', 'updatedAt'])
+        && data.shortCode is string && data.shortCode == shortCode && isValidShortCode(data.shortCode)
+        && data.ownerId is string && isValidId(data.ownerId)
+        && data.targetUrl is string && data.targetUrl.size() >= 12 && data.targetUrl.size() <= 4096
+        && data.targetUrl.matches('^https://(wa\\.me|api\\.whatsapp\\.com)/.*')
+        && data.active is bool
+        && data.clickCount is int && data.clickCount >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidClickEvent(data, shortCode, clickId) {
+      return data.keys().hasAll(['clickId', 'shortCode', 'ownerId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
+        && data.keys().hasOnly(['clickId', 'shortCode', 'ownerId', 'deviceType', 'browser', 'os', 'referrer', 'clickedAt'])
+        && data.clickId is string && data.clickId == clickId && data.clickId.size() >= 6 && data.clickId.size() <= 64
+        && data.shortCode is string && data.shortCode == shortCode && isValidShortCode(data.shortCode)
+        && data.ownerId is string && isValidId(data.ownerId)
+        && data.deviceType is string && data.deviceType in ['mobile', 'desktop', 'tablet']
+        && data.browser is string && data.browser.size() >= 1 && data.browser.size() <= 60
+        && data.os is string && data.os.size() >= 1 && data.os.size() <= 60
+        && data.referrer is string && data.referrer.size() >= 1 && data.referrer.size() <= 120
+        && data.clickedAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'updatedAt']);
+      allow delete: if false;
+
+      match /links/{linkId} {
+        allow get: if isValidId(userId) && isValidId(linkId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(linkId)
+          && isOwner(userId)
+          && isValidUserLink(incoming(), userId, linkId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId)
+          && isValidId(linkId)
+          && isOwner(userId)
+          && isValidUserLink(incoming(), userId, linkId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['label', 'countryCode', 'phone', 'message', 'targetUrl', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['active', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(linkId) && isOwner(userId);
+      }
+    }
+
+    match /publicRedirects/{shortCode} {
+      allow get: if isValidShortCode(shortCode);
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidShortCode(shortCode)
+        && isSignedIn()
+        && isValidPublicRedirect(incoming(), shortCode)
+        && incoming().ownerId == request.auth.uid
+        && incoming().clickCount == 0
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortCode(shortCode)
+        && isValidPublicRedirect(incoming(), shortCode)
+        && incoming().updatedAt == request.time
+        && incoming().createdAt == existing().createdAt
+        && incoming().ownerId == existing().ownerId
+        && incoming().shortCode == existing().shortCode
+        && (
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'targetUrl', 'updatedAt']))
+          || (existing().active == true && incoming().diff(existing()).affectedKeys().hasOnly(['clickCount', 'updatedAt']) && incoming().clickCount == existing().clickCount + 1)
+        );
+      allow delete: if isValidShortCode(shortCode) && isSignedIn() && existing().ownerId == request.auth.uid;
+
+      match /clicks/{clickId} {
+        allow get: if isValidShortCode(shortCode) && isValidId(clickId) && isSignedIn() && existing().ownerId == request.auth.uid;
+        allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidShortCode(shortCode)
+          && isValidId(clickId)
+          && isValidClickEvent(incoming(), shortCode, clickId)
+          && incoming().clickedAt == request.time
+          && exists(/databases/$(database)/documents/publicRedirects/$(shortCode))
+          && get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.active == true
+          && incoming().ownerId == get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.ownerId
+          && getAfter(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.clickCount == get(/databases/$(database)/documents/publicRedirects/$(shortCode)).data.clickCount + 1;
+        allow update: if false;
+        allow delete: if isValidShortCode(shortCode) && isValidId(clickId) && isSignedIn() && existing().ownerId == request.auth.uid;
+      }
+    }
+  }
+}

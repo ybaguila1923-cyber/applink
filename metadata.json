@@ -1,0 +1,6 @@
+{
+  "name": "EnlaceFlow",
+  "description": "Generador de URL de WhatsApp con mensajes personalizados, acortador de enlaces, estadísticas de clics e historial por usuario, además de descargador multimedia y conversor de video a MP3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
